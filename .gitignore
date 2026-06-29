@@ -19,6 +19,11 @@ sim_netlist/
 *.str
 *.xml
 
+# Claude / local assistant artifacts
+.claude/
+CLAUDE.md
+*.local.json
+
 # OS/editor noise
 .DS_Store
 .vscode/

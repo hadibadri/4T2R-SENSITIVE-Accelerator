@@ -1,67 +1,4 @@
-// -----------------------------------------------------------------------------
-// tb_dispatcher_compute.sv
-//
-// Layer-2 integration testbench: dispatcher + noc_fabric (N_SOURCES=1) +
-// dense_array + sparse_tile.
-//
-// Topology under test
-// -------------------
-//   imem (TB write)                          weight-scan port (TB write)
-//        |                                               |
-//        v                                               v
-//   +-----------+    noc_cfg_if   +-------------+  +----------------+
-//   |dispatcher |----------------->| noc_fabric |->| dense_array    |
-//   |           |    path_id_o    |  1 source  |  |  (via dst[0..7]|
-//   |           |---------------->|  64 dsts   |  |   -> a_strm[gr])|
-//   |           |    gemm_iss_if  +-------------+  +----------------+
-//   |           |--- busy,acc_clr,acc_snap,k_cnt -> TB (plays driver)
-//   |           |<--- beat_fire ---------------- TB (= src[0] fire)
-//   |           |    tlmm_iss_if
-//   |           |--- start,busy,k_cnt ---------> TB (plays driver)
-//   |           |<--- done ----------------------+
-//   +-----------+                                |
-//                                                v
-//                                          sparse_tile
-//                                       (TB drives tlmm_ctrl_if
-//                                        PROG / COMPUTE channels,
-//                                        scoreboards OUT channel)
-//
-// The TB plays two roles that in Layer 3 belong to the memory manager and
-// the TLMM driver:
-//   * GEMM driver: while dispatcher.gemm.busy is high, streams k_cnt
-//     activation beats into noc_fabric.src[0]. beat_fire is fed back as
-//     (src[0].valid && src[0].ready).
-//   * TLMM driver: on dispatcher.tlmm.start pulse, runs a PROG handshake,
-//     waits for the tile to finish filling tables, streams k_cnt compute
-//     beats, and pulses tlmm.done once all k_cnt OUT beats have been
-//     captured.
-//
-// Program under test
-//   0  OP_NOP
-//   1  OP_CFG_NOC MASK_LO handle=0 payload=mask[31:0]
-//   2  OP_CFG_NOC MASK_HI handle=0 payload=mask[63:32]
-//   3  OP_CFG_NOC META    handle=0 src=0, prio=0, is_mc=1
-//   4  OP_BARRIER
-//   5  OP_COMMIT_NOC
-//   6  OP_GEMM_ALL       path_id=0, k_cnt=K_GEMM
-//   7  OP_BARRIER
-//   8  OP_FFN_TLMM       k_cnt=K_FFN
-//   9  OP_EOP
-//
-// Phase-7d note: the dense_array is now the time-multiplexed 16x32 kernel, and
-// the dispatcher's OP_GEMM is ONE logical tile's reduction. This TB therefore
-// validates a SINGLE-TILE GEMM (tile 0,0): the TB plays host and holds
-// tile_gr=tile_gc=0, pulses tile_first before the first acc_clr, and drives
-// tile_last with acc_snap. The full 32-tile layer walk is host orchestration
-// that belongs in tb_archbetter_top. The 16-wide activation beat broadcasts to
-// both physical groups, so:
-//   y[c] = sum_k sum_r a[k][r] * W[r, c]   for c in [0..31]; 0 otherwise.
-//
-// Checks
-//   GEMM : y_out[128] matches SV golden (cols 0..31 = tile result, rest 0).
-//   FFN  : captured o_parts sequence matches SV golden for K_FFN beats.
-//   Program: dispatcher.program_done rises and stays high.
-// -----------------------------------------------------------------------------
+
 `ifndef ARCHBETTER_TB_DISPATCHER_COMPUTE_SV
 `define ARCHBETTER_TB_DISPATCHER_COMPUTE_SV
 `default_nettype none
@@ -70,10 +7,6 @@
 module tb_dispatcher_compute
     import types_pkg::*;
 ();
-
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
     localparam time T_CLK       = 10ns;
     localparam int  N_SOURCES   = 1;
     localparam int  IMEM_DEPTH  = 64;
@@ -81,18 +14,16 @@ module tb_dispatcher_compute
     localparam int  DATA_W      = NOC_DATA_W;
     localparam int  USER_W      = NOC_USER_W;
 
-    localparam int  ROWS        = DENSE_ARRAY_ROWS;    // 128
-    localparam int  COLS        = DENSE_ARRAY_COLS;    // 128
-    localparam int  GROWS       = DENSE_GROUPS_ROW;    //   8
-    localparam int  GCOLS       = DENSE_GROUPS_COL;    //   8
-    localparam int  GRS         = DENSE_GROUP_ROWS;    //  16
-    localparam int  GCS         = DENSE_GROUP_COLS;    //  16
+    localparam int  ROWS        = DENSE_ARRAY_ROWS;
+    localparam int  COLS        = DENSE_ARRAY_COLS;
+    localparam int  GROWS       = DENSE_GROUPS_ROW;
+    localparam int  GCOLS       = DENSE_GROUPS_COL;
+    localparam int  GRS         = DENSE_GROUP_ROWS;
+    localparam int  GCS         = DENSE_GROUP_COLS;
     localparam int  PE_ADDR_W   = $clog2(DENSE_PE_PER_GROUP);
 
     localparam int  K_GEMM      = 2;
     localparam int  K_FFN       = 3;
-
-    // Multicast all 8 group-row destinations (dst[0..7]).
     localparam noc_mask_t TGT_MASK = noc_mask_t'(64'h0000_0000_0000_00FF);
     localparam logic [31:0] TGT_MASK_LO = TGT_MASK[31:0];
     localparam logic [31:0] TGT_MASK_HI = TGT_MASK[63:32];
@@ -100,64 +31,38 @@ module tb_dispatcher_compute
     localparam logic [2:0]  TGT_PRIORITY     = 3'd0;
     localparam logic        TGT_IS_MULTICAST = 1'b1;
     localparam logic [NOC_PATH_ID_W-1:0] TGT_HANDLE = '0;
-
-    // -------------------------------------------------------------------------
-    // Clock / reset
-    // -------------------------------------------------------------------------
     logic clk, rst_n;
     initial clk = 1'b0;
     always  #(T_CLK/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // Interfaces
-    // -------------------------------------------------------------------------
     noc_cfg_if cfg_bus [N_SOURCES] (.clk(clk), .rst_n(rst_n));
 
     strm_if #(.DATA_W(DATA_W), .USER_W(USER_W))
         src      [N_SOURCES] (.clk(clk), .rst_n(rst_n));
     strm_if #(.DATA_W(DATA_W), .USER_W(USER_W))
         noc_dst  [NOC_NODES]  (.clk(clk), .rst_n(rst_n));
-    // Phase-7d: the time-multiplexed dense_array has a SINGLE activation stream.
-    // The 8 row-tile NoC drops noc_dst[0..7] are muxed by tile_gr below, exactly
-    // as archbetter_top does.
     strm_if #(.DATA_W(DATA_W), .USER_W(USER_W))
         a_strm                (.clk(clk), .rst_n(rst_n));
 
     gemm_issue_if gemm_bus (.clk(clk), .rst_n(rst_n));
     tlmm_issue_if tlmm_bus (.clk(clk), .rst_n(rst_n));
     tlmm_ctrl_if  ctrl     (.clk(clk), .rst_n(rst_n));
-
-    // Layer-3 dispatcher ports the program never exercises (no mem / KV ops),
-    // tied off so elaboration is happy and the dispatcher never blocks on them.
     mem_issue_if  mem_if   (.clk(clk), .rst_n(rst_n));
     kv_access_if  kv_if    (.clk(clk), .rst_n(rst_n));
-    assign mem_if.done    = 1'b0;   // no OP_LD / OP_ST_OUT / OP_PINGPONG issued
+    assign mem_if.done    = 1'b0;
     assign kv_if.rd_data  = '0;
-    assign kv_if.rd_valid = 1'b0;   // no OP_KV_READ issued
-
-    // Phase-8 dense_sched_if. This TB runs OP_GEMM_ALL (single tile), never
-    // OP_GEMM_LAYER, so the dispatcher's tile-walker stays idle. Tie off the
-    // streamer side (load_done + scan bus) so elaboration is clean.
+    assign kv_if.rd_valid = 1'b0;
     dense_sched_if sched_bus (.clk(clk), .rst_n(rst_n));
     assign sched_bus.load_done = 1'b0;
     assign sched_bus.w_we      = 1'b0;
     assign sched_bus.w_phys_gc = '0;
     assign sched_bus.w_pe_addr = '0;
     assign sched_bus.w_in      = '0;
-
-    // -------------------------------------------------------------------------
-    // Dispatcher control / imem sideband
-    // -------------------------------------------------------------------------
     logic                    start;
     logic                    program_done;
     logic                    imem_we;
     logic [IMEM_ADDR_W-1:0]  imem_wr_addr;
     logic [MACRO_WORD_W-1:0] imem_wr_data;
     logic [NOC_PATH_ID_W-1:0] path_id [N_SOURCES];
-
-    // -------------------------------------------------------------------------
-    // DUTs
-    // -------------------------------------------------------------------------
     dispatcher #(
         .IMEM_DEPTH    (IMEM_DEPTH),
         .N_NOC_SOURCES (N_SOURCES)
@@ -192,19 +97,10 @@ module tb_dispatcher_compute
         .src     (src),
         .dst     (noc_dst)
     );
-
-    // Weight-scan sideband for dense_array (Phase-7d: w_phys_gc selects which of
-    // the 2 physical column-groups receives the beat).
     logic                  w_we;
     logic                  w_phys_gc;
     logic [PE_ADDR_W-1:0]  w_pe_addr;
-    bfp12_mant_t [(BFP12_BLK/2)-1:0] w_in;   // 8 mantissas/beat (C1.5)
-
-    // Time-multiplex tile schedule. This is a SINGLE-TILE GEMM test (tile 0,0):
-    // the dispatcher's unit of work is one 16x32 tile, so the TB (acting as the
-    // host) holds tile_gr/tile_gc at 0, pulses tile_first before the first
-    // acc_clr, and drives tile_last concurrent with acc_snap. The full 32-tile
-    // layer walk is host orchestration that lives in tb_archbetter_top.
+    bfp12_mant_t [(BFP12_BLK/2)-1:0] w_in;
     logic [$clog2(DENSE_LOGICAL_TILE_ROWS)-1:0] tile_gr;
     logic [$clog2(DENSE_LOGICAL_TILE_COLS)-1:0] tile_gc;
     logic                  tile_first;
@@ -229,7 +125,7 @@ module tb_dispatcher_compute
         .tile_last (tile_last),
         .acc_clr   (gemm_bus.acc_clr),
         .acc_snap  (gemm_bus.acc_snap),
-        .stream_mode (GEMM_SNAP_PER_TOKEN),   // R6.3: dispatcher TB runs v1 path
+        .stream_mode (GEMM_SNAP_PER_TOKEN),
         .w_we      (w_we),
         .w_phys_gc (w_phys_gc),
         .w_pe_addr (w_pe_addr),
@@ -237,15 +133,6 @@ module tb_dispatcher_compute
         .y_out     (y_out),
         .y_valid   (y_valid)
     );
-
-    // -------------------------------------------------------------------------
-    // Tile schedule driving (single-tile test).
-    //   tile_gr/tile_gc : held at 0.
-    //   tile_first      : 1-cycle pulse on the rising edge of gemm.busy, before
-    //                     the first acc_clr — clears the array bank.
-    //   tile_last       : driven concurrent with acc_snap (this is the only and
-    //                     therefore the last tile of the layer).
-    // -------------------------------------------------------------------------
     assign tile_gr = '0;
     assign tile_gc = '0;
 
@@ -262,20 +149,11 @@ module tb_dispatcher_compute
         .rst_n (rst_n),
         .ctrl  (ctrl.tile)
     );
-
-    // -------------------------------------------------------------------------
-    // src[0] drive: combinational from gemm.busy and beats_fired.
-    //   TB is the "memory manager proxy": on the first cycle gemm.busy rises,
-    //   src[0].valid goes high and stays high until k_cnt beats have fired.
-    //   Data is pre-loaded by the TB before start.
-    // -------------------------------------------------------------------------
     logic [DATA_W-1:0] s0_data;
     logic              s0_valid;
     logic              s0_last;
     logic              s0_ready_obs;
     int                beats_fired;
-
-    // Pre-packed activation payloads, one per GEMM beat.
     logic [DATA_W-1:0] act_beats [K_GEMM];
 
     assign s0_data  = (beats_fired < K_GEMM) ? act_beats[beats_fired] : '0;
@@ -287,8 +165,6 @@ module tb_dispatcher_compute
     assign src[0].valid = s0_valid;
     assign src[0].last  = s0_last;
     assign s0_ready_obs = src[0].ready;
-
-    // beat_fire is the control-plane feedback to the dispatcher.
     assign gemm_bus.beat_fire = s0_valid && s0_ready_obs;
 
     always_ff @(posedge clk) begin
@@ -300,14 +176,6 @@ module tb_dispatcher_compute
             beats_fired <= beats_fired + 1;
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Phase-7d row-tile mux (mirrors archbetter_top): of the 8 row-tile NoC
-    // drops noc_dst[0..7], only the one selected by tile_gr is forwarded to the
-    // dense_array's single activation stream. SV forbids runtime-indexing an
-    // interface array, so unbundle into plain arrays first, then mux by tile_gr.
-    // The unused dst[8..63] are tied ready=1.
-    // -------------------------------------------------------------------------
     logic [DATA_W-1:0] dst_data_unbund  [DENSE_LOGICAL_TILE_ROWS];
     logic [USER_W-1:0] dst_user_unbund  [DENSE_LOGICAL_TILE_ROWS];
     logic              dst_valid_unbund [DENSE_LOGICAL_TILE_ROWS];
@@ -334,18 +202,11 @@ module tb_dispatcher_compute
     begin : gen_dst_tie
         assign noc_dst[D].ready = 1'b1;
     end : gen_dst_tie
-
-    // -------------------------------------------------------------------------
-    // Weight mirror + golden storage
-    // -------------------------------------------------------------------------
     bfp12_mant_t         weights_ref [ROWS][COLS];
-    bfp12_mant_t         a_gemm_vec  [K_GEMM][GRS];  // per beat: 16 mantissas
+    bfp12_mant_t         a_gemm_vec  [K_GEMM][GRS];
     array_acc_t [COLS-1:0] y_expected;
     array_acc_t [COLS-1:0] y_snapped;
     logic                  y_snap_seen;
-
-    // Single-driver capture: y_snap_seen is reset by rst_n and set on y_valid in
-    // this always_ff only (no procedural init elsewhere) so it elaborates clean.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             y_snap_seen <= 1'b0;
@@ -354,10 +215,6 @@ module tb_dispatcher_compute
             y_snap_seen <= 1'b1;
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Instruction-word builder (reused from tb_dispatcher_noc).
-    // -------------------------------------------------------------------------
     function automatic logic [MACRO_WORD_W-1:0] mk_instr(
         input macro_opc_e  opc,
         input logic [7:0]  tile_id,
@@ -385,18 +242,12 @@ module tb_dispatcher_compute
         p[0]    = is_multicast;
         return p;
     endfunction
-
-    // k_cnt sits at instr_raw[21:12] (macro_instr_t::k_cnt is bits [21:12]).
     function automatic logic [31:0] mk_kcnt_payload(input int k_cnt);
         logic [31:0] p;
         p = '0;
         p[21:12] = k_cnt[9:0];
         return p;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // TB-side imem write.
-    // -------------------------------------------------------------------------
     task automatic imem_write(
         input logic [IMEM_ADDR_W-1:0]  addr,
         input logic [MACRO_WORD_W-1:0] word
@@ -408,25 +259,17 @@ module tb_dispatcher_compute
         @(posedge clk);
         imem_we      <= 1'b0;
     endtask
-
-    // -------------------------------------------------------------------------
-    // Weight scan for the single tile (0,0): the 16x32 physical kernel holds
-    // rows [0..15] x cols [0..31]. Phys group 0 -> cols [0..15], phys group 1 ->
-    // cols [16..31]; pe_addr within a group = local_r*16 + local_c.
-    // -------------------------------------------------------------------------
     task automatic program_weights();
-        localparam int WSCAN = BFP12_BLK / 2;   // 8 PEs/beat
+        localparam int WSCAN = BFP12_BLK / 2;
         for (int local_r = 0; local_r < GRS; local_r++) begin
             for (int half = 0; half < GCS / WSCAN; half++) begin
                 automatic int c_base = half * WSCAN;
-                // phys group 0 (cols 0..15)
                 @(posedge clk);
                 for (int s = 0; s < WSCAN; s++)
                     w_in[s] <= weights_ref[local_r][c_base + s];
                 w_we      <= 1'b1;
                 w_phys_gc <= 1'b0;
                 w_pe_addr <= PE_ADDR_W'(local_r * GCS + c_base);
-                // phys group 1 (cols 16..31)
                 @(posedge clk);
                 for (int s = 0; s < WSCAN; s++)
                     w_in[s] <= weights_ref[local_r][GCS + c_base + s];
@@ -439,21 +282,12 @@ module tb_dispatcher_compute
         w_we <= 1'b0;
         w_in <= '0;
     endtask
-
-    // -------------------------------------------------------------------------
-    // Build activations and golden for the GEMM op. One 192b beat carries 16
-    // mantissas; every group-row sees the same beat (broadcast), so the
-    // effective GEMV collapses to sum_{gr,r}.
-    // -------------------------------------------------------------------------
     task automatic build_gemm_vectors();
-        // Simple, diagnostic activation vectors.
         for (int k = 0; k < K_GEMM; k++) begin
             for (int r = 0; r < GRS; r++) begin
                 a_gemm_vec[k][r] = bfp12_mant_t'(signed'(k*10 + r + 1));
             end
         end
-
-        // Pack each beat into a 192b word (row r -> bits [r*12 +: 12]).
         for (int k = 0; k < K_GEMM; k++) begin
             automatic logic [DATA_W-1:0] d;
             d = '0;
@@ -462,12 +296,6 @@ module tb_dispatcher_compute
             end
             act_beats[k] = d;
         end
-
-        // Golden for the SINGLE tile (0,0): only rows [0..15] and cols [0..31]
-        // participate. The 16-wide activation beat broadcasts to both physical
-        // groups, so y[c] = sum_k sum_r a[k][r] * W[r, c] for c in [0..31]; all
-        // other columns stay 0 (bank cleared by tile_first, only tile_gc=0's
-        // 32-col strip is written).
         for (int c = 0; c < COLS; c++) y_expected[c] = '0;
         for (int c = 0; c < int'(DENSE_PHYS_COLS); c++) begin
             automatic array_acc_t acc;
@@ -483,10 +311,6 @@ module tb_dispatcher_compute
             y_expected[c] = acc;
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // FFN data + golden
-    // -------------------------------------------------------------------------
     bfp12_mant_t      ffn_acts   [TLMM_TILE];
     tern_lane_tiles_t ffn_wbeats [K_FFN];
     tlmm_part_vec_t   ffn_expected_q [$];
@@ -502,20 +326,16 @@ module tb_dispatcher_compute
                 TERN_POS : acc += $signed(ffn_acts[i]);
                 TERN_NEG : acc -= $signed(ffn_acts[i]);
                 TERN_ZERO: ;
-                default  : ; // TERN_RSVD treated as zero (never generated here)
+                default  : ;
             endcase
         end
         return tlmm_tile_part_t'(acc);
     endfunction
 
     task automatic build_ffn_vectors();
-        // Stationary activations: small signed ramp.
         for (int i = 0; i < int'(TLMM_TILE); i++) begin
             ffn_acts[i] = bfp12_mant_t'(signed'(3 + i));
         end
-
-        // Ternary weight beats: a mix per lane per beat. Keep pattern simple
-        // and deterministic so failure mode is legible.
         for (int b = 0; b < K_FFN; b++) begin
             for (int l = 0; l < int'(TLMM_LANES); l++) begin
                 for (int i = 0; i < int'(TLMM_TILE); i++) begin
@@ -528,8 +348,6 @@ module tb_dispatcher_compute
                 end
             end
         end
-
-        // Golden.
         ffn_expected_q.delete();
         for (int b = 0; b < K_FFN; b++) begin
             tlmm_part_vec_t v;
@@ -539,38 +357,23 @@ module tb_dispatcher_compute
             ffn_expected_q.push_back(v);
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // OUT scoreboard: capture every accepted o_parts beat.
-    // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst_n && ctrl.o_valid && ctrl.o_ready) begin
             ffn_captured_q.push_back(ctrl.o_parts);
         end
     end
-
-    // -------------------------------------------------------------------------
-    // TLMM driver process: on every tlmm.start pulse, run PROG, then stream
-    // k_cnt compute beats, then pulse done once all k_cnt OUT beats are in.
-    // -------------------------------------------------------------------------
     task automatic tlmm_drive_once();
         int issued;
         int need;
         tlmm_tile_act_t packed_acts;
 
         need = int'(tlmm_bus.k_cnt);
-
-        // 1. PROG: pack and drive acts until prog_ready fires.
         for (int i = 0; i < int'(TLMM_TILE); i++) packed_acts[i] = ffn_acts[i];
         ctrl.prog_acts  <= packed_acts;
         ctrl.prog_valid <= 1'b1;
         do @(posedge clk); while (!ctrl.prog_ready);
         ctrl.prog_valid <= 1'b0;
-
-        // 2. Wait for tile to finish filling tables.
         while (!ctrl.w_ready) @(posedge clk);
-
-        // 3. Stream need compute beats.
         issued = 0;
         while (issued < need) begin
             ctrl.w_tiles <= ffn_wbeats[issued];
@@ -582,11 +385,7 @@ module tb_dispatcher_compute
         end
         ctrl.w_valid <= 1'b0;
         ctrl.w_tiles <= '0;
-
-        // 4. Wait until scoreboard has captured all need OUT beats.
         while (ffn_captured_q.size() < need) @(posedge clk);
-
-        // 5. Pulse done.
         tlmm_bus.done <= 1'b1;
         @(posedge clk);
         tlmm_bus.done <= 1'b0;
@@ -597,7 +396,7 @@ module tb_dispatcher_compute
         ctrl.prog_valid <= 1'b0;
         ctrl.w_tiles    <= '0;
         ctrl.w_valid    <= 1'b0;
-        ctrl.o_ready    <= 1'b1;   // always accept
+        ctrl.o_ready    <= 1'b1;
         tlmm_bus.done   <= 1'b0;
 
         @(posedge clk iff rst_n);
@@ -607,29 +406,16 @@ module tb_dispatcher_compute
             tlmm_drive_once();
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Weight-plane filler. A simple scheme: W[r][c] = ((r + c) % 5) - 2.
-    // Small signed values so the accumulator stays well inside array_acc_t.
-    // -------------------------------------------------------------------------
     task automatic fill_weights_diag_mix();
         for (int r = 0; r < ROWS; r++) begin
             for (int c = 0; c < COLS; c++) begin
-                automatic int v = ((r + c) % 5) - 2; // range [-2, +2]
+                automatic int v = ((r + c) % 5) - 2;
                 weights_ref[r][c] = bfp12_mant_t'(signed'(v));
             end
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Scoreboard
-    // -------------------------------------------------------------------------
     int n_errors;
     int n_checks;
-
-    // -------------------------------------------------------------------------
-    // Main
-    // -------------------------------------------------------------------------
     initial begin : main
         logic [IMEM_ADDR_W-1:0] a;
         int waited;
@@ -649,12 +435,6 @@ module tb_dispatcher_compute
         repeat (5) @(posedge clk);
         rst_n <= 1'b1;
         @(posedge clk);
-
-        // ---------------------------------------------------------------------
-        // Pre-stage: build vectors, program weights, build FFN data.
-        // This ALL happens before start, so dispatcher stays in S_IDLE and the
-        // a_imem_write_only_idle assert is satisfied.
-        // ---------------------------------------------------------------------
         $display("[%0t] STAGE 0: fill weight plane + build golden", $time);
         fill_weights_diag_mix();
         build_gemm_vectors();
@@ -689,10 +469,6 @@ module tb_dispatcher_compute
         imem_write(a, mk_instr(OP_FFN_TLMM,   8'h00, 8'h00,
                                mk_kcnt_payload(K_FFN))); a++;
         imem_write(a, mk_instr(OP_EOP,        8'h00, 8'h00, 32'h0)); a++;
-
-        // ---------------------------------------------------------------------
-        // STAGE 3: start and wait for program_done.
-        // ---------------------------------------------------------------------
         $display("[%0t] STAGE 3: start dispatcher", $time);
         @(posedge clk);
         start <= 1'b1;
@@ -707,13 +483,7 @@ module tb_dispatcher_compute
                 $fatal(1, "program_done never asserted (waited %0d cycles)", waited);
         end
         $display("[%0t] program_done asserted after %0d cycles", $time, waited);
-
-        // Let residual pipeline finish.
         repeat (8) @(posedge clk);
-
-        // ---------------------------------------------------------------------
-        // STAGE 4: GEMM check
-        // ---------------------------------------------------------------------
         n_checks++;
         if (!y_snap_seen) begin
             n_errors++;
@@ -738,10 +508,6 @@ module tb_dispatcher_compute
                 $display("[%0t] GEMM FAIL: %0d/%0d columns mismatched",
                          $time, col_errs, COLS);
         end
-
-        // ---------------------------------------------------------------------
-        // STAGE 5: FFN check
-        // ---------------------------------------------------------------------
         n_checks++;
         if (ffn_captured_q.size() != K_FFN) begin
             n_errors++;
@@ -762,10 +528,6 @@ module tb_dispatcher_compute
             end
             $display("[%0t] FFN check done (%0d beats)", $time, K_FFN);
         end
-
-        // ---------------------------------------------------------------------
-        // Finish
-        // ---------------------------------------------------------------------
         if (n_errors == 0 && n_checks > 0) begin
             $display("=========================================================");
             $display(" tb_dispatcher_compute: PASS  (%0d checks, 0 errors)",
@@ -781,7 +543,6 @@ module tb_dispatcher_compute
     end
 
     initial begin : watchdog
-        // Budget: 16k cycles for weight scan + a few hundred for the program.
         #(T_CLK * 500_000);
         $fatal(1, "tb_dispatcher_compute: watchdog timeout");
     end
@@ -789,4 +550,4 @@ module tb_dispatcher_compute
 endmodule : tb_dispatcher_compute
 
 `default_nettype wire
-`endif // ARCHBETTER_TB_DISPATCHER_COMPUTE_SV
+`endif

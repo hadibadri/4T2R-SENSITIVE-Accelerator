@@ -1,22 +1,4 @@
-// -----------------------------------------------------------------------------
-// tb_dense_group.sv
-//
-// Golden testbench for dense_group. Programs a 16x16 weight plane, streams K
-// BFP12 activation blocks through the group's strm_if sink, drives the
-// acc_clr / acc_snap sideband to the group's contract, and compares the 16
-// column outputs against a pure-SV reference.
-//
-// Directed:
-//   * K=1, identity weights (W[i,j] = (i==j)) -> y = first activation vector
-//   * K=1, all-zero weights                   -> y = 0
-//   * K=4, small ints                         -> hand-check
-//   * K=16, max-magnitude weights + activations (exercise GROUP_ACC_W)
-//
-// Random:
-//   * Two weight epochs. Each epoch programs a new random 16x16 weight plane,
-//     then runs N_RAND_PER_EPOCH reductions with random K in [1, K_MAX] and
-//     random activations.
-// -----------------------------------------------------------------------------
+
 `ifndef ARCHBETTER_TB_DENSE_GROUP_SV
 `define ARCHBETTER_TB_DENSE_GROUP_SV
 `default_nettype none
@@ -25,9 +7,6 @@
 module tb_dense_group
     import types_pkg::*;
 ();
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
     localparam time T_CLK             = 10ns;
     localparam int  K_MAX             = 16;
     localparam int  N_RAND_PER_EPOCH  = 50;
@@ -35,10 +14,6 @@ module tb_dense_group
 
     localparam int  ROWS = DENSE_GROUP_ROWS;
     localparam int  COLS = DENSE_GROUP_COLS;
-
-    // -------------------------------------------------------------------------
-    // DUT nets
-    // -------------------------------------------------------------------------
     logic clk, rst_n;
 
     strm_if #(.DATA_W(NOC_DATA_W), .USER_W(NOC_USER_W))
@@ -48,7 +23,7 @@ module tb_dense_group
     gemm_stream_mode_e                             stream_mode;
     logic                                          w_we;
     logic [$clog2(DENSE_PE_PER_GROUP)-1:0]         w_addr;
-    bfp12_mant_t [(BFP12_BLK/2)-1:0]               w_in;   // 8 mantissas/beat (C1.5)
+    bfp12_mant_t [(BFP12_BLK/2)-1:0]               w_in;
     group_acc_t [DENSE_GROUP_COLS-1:0]             y_out;
     logic                                          y_valid;
 
@@ -68,30 +43,14 @@ module tb_dense_group
         .y_out    (y_out),
         .y_valid  (y_valid)
     );
-
-    // -------------------------------------------------------------------------
-    // Clock
-    // -------------------------------------------------------------------------
     initial clk = 1'b0;
     always  #(T_CLK/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // Reference mirror of the weight matrix
-    // -------------------------------------------------------------------------
     bfp12_mant_t weights_ref [ROWS][COLS];
-
-    // -------------------------------------------------------------------------
-    // Snapshot capture
-    // -------------------------------------------------------------------------
     group_acc_t [DENSE_GROUP_COLS-1:0] y_snapped;
     logic                              snap_seen;
-    logic                              snap_clr;   // task-driven 1-cycle clear
+    logic                              snap_clr;
     int                                n_reductions;
     int                                n_errors;
-
-    // snap_seen is driven ONLY here (single process) — the reduction task clears
-    // it via the clocked snap_clr handshake rather than writing it directly,
-    // which removes the prior VRFC-10-3818/10-2921 multi-driver warnings.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             snap_seen <= 1'b0;
@@ -99,25 +58,18 @@ module tb_dense_group
             if (snap_clr) snap_seen <= 1'b0;
             if (y_valid) begin
                 y_snapped <= y_out;
-                snap_seen <= 1'b1;   // y_valid wins a same-cycle race with clr
+                snap_seen <= 1'b1;
             end
         end
     end
-
-    // v2 (CONTINUOUS) capture: record every per-token y_out partial in order.
     group_acc_t [DENSE_GROUP_COLS-1:0] cont_cap [$];
     logic                              cont_capturing;
     always_ff @(posedge clk) begin
         if (rst_n && cont_capturing && y_valid)
             cont_cap.push_back(y_out);
     end
-
-    // -------------------------------------------------------------------------
-    // Weight programming — scan in all 256, mirror into weights_ref.
-    // -------------------------------------------------------------------------
-    // C1.5: scan a whole word (8 PEs = one row's half) per beat.
     task automatic program_weights(input bfp12_mant_t wm[ROWS][COLS]);
-        localparam int WSCAN = BFP12_BLK / 2;   // 8
+        localparam int WSCAN = BFP12_BLK / 2;
         for (int r = 0; r < ROWS; r++) begin
             for (int half = 0; half < COLS / WSCAN; half++) begin
                 automatic int c_base = half * WSCAN;
@@ -134,12 +86,6 @@ module tb_dense_group
         w_we <= 1'b0;
         w_in <= '0;
     endtask
-
-    // -------------------------------------------------------------------------
-    // Drive one K-beat reduction through the strm_if sink.
-    // acts[k][r] = activation mantissa for row r at beat k.
-    // expected[c] filled by the reference.
-    // -------------------------------------------------------------------------
     task automatic run_reduction(
         input  bfp12_mant_t                 acts[$][ROWS],
         output group_acc_t                  expected[COLS]
@@ -175,15 +121,10 @@ module tb_dense_group
         a_strm_if.valid <= 1'b0;
         a_strm_if.last  <= 1'b0;
         acc_clr         <= 1'b0;
-
-        // Fused-MACC drain, then snap. The DSP P register holds the completed
-        // sum once a_strm.valid drops, so a generous drain is always safe.
         repeat (4) @(posedge clk);
         acc_snap <= 1'b1;
         @(posedge clk);
         acc_snap <= 1'b0;
-
-        // Two cycles for PE acc_out_valid -> group y_valid -> capture.
         @(posedge clk);
         @(posedge clk);
         @(posedge clk);
@@ -207,10 +148,6 @@ module tb_dense_group
             end
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Helpers to build weight matrices and activation beat lists
-    // -------------------------------------------------------------------------
     function automatic void fill_weights_zero(ref bfp12_mant_t wm[ROWS][COLS]);
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++)
@@ -237,10 +174,6 @@ module tb_dense_group
             for (int c = 0; c < COLS; c++)
                 wm[r][c] = bfp12_mant_t'($urandom());
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Directed
-    // -------------------------------------------------------------------------
     task automatic run_directed();
         bfp12_mant_t wm[ROWS][COLS];
         group_acc_t  expected[COLS];
@@ -297,24 +230,13 @@ module tb_dense_group
             check_reduction(expected, "K=16 max");
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // v2 continuous snap: weights are programmed once, then T per-token K=1
-    // activation vectors stream at II=1 with acc_clr=1 on every beat. The group
-    // must emit one 16-wide partial per token, in order, each = the K=1 product
-    // of that token's vector against the resident weight plane. No acc_snap is
-    // pulsed; the per-beat cell valid drives a continuous y_valid. This is the
-    // group-level proof of the prefill compute-bound path.
-    // -------------------------------------------------------------------------
     task automatic run_continuous_group(
-        input bfp12_mant_t acts[$][ROWS],     // one vector per token
+        input bfp12_mant_t acts[$][ROWS],
         input string       label
     );
         int unsigned T = acts.size();
         logic [NOC_DATA_W-1:0] packed_data;
-        group_acc_t expected[$];              // [token][col] flattened per token
-
-        // Reference: T independent K=1 partials against weights_ref.
+        group_acc_t expected[$];
         expected.delete();
         for (int t = 0; t < int'(T); t++) begin
             for (int c = 0; c < COLS; c++) begin
@@ -337,15 +259,13 @@ module tb_dense_group
             a_strm_if.user  <= '0;
             a_strm_if.valid <= 1'b1;
             a_strm_if.last  <= (t == int'(T)-1);
-            acc_clr         <= 1'b1;          // fresh K=1 LOAD per token
+            acc_clr         <= 1'b1;
             @(posedge clk);
         end
         a_strm_if.data  <= '0;
         a_strm_if.valid <= 1'b0;
         a_strm_if.last  <= 1'b0;
         acc_clr         <= 1'b0;
-        // Drain so the last token's partial (a_fire + DENSE_CONT_RESULT_LAT)
-        // is captured.
         repeat (DENSE_CONT_RESULT_LAT + 3) @(posedge clk);
         cont_capturing = 1'b0;
 
@@ -397,10 +317,6 @@ module tb_dense_group
             run_continuous_group(acts, "cont T=32 random");
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Random
-    // -------------------------------------------------------------------------
     task automatic run_random_epoch(input int epoch_id);
         bfp12_mant_t wm[ROWS][COLS];
         group_acc_t  expected[COLS];
@@ -423,10 +339,6 @@ module tb_dense_group
             check_reduction(expected, $sformatf("ep%0d r=%0d K=%0d", epoch_id, r, K));
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Main
-    // -------------------------------------------------------------------------
     initial begin
         rst_n           = 1'b0;
         a_strm_if.data  = '0;
@@ -465,8 +377,6 @@ module tb_dense_group
 
         $finish;
     end
-
-    // Watchdog: ~5ms guard on an expected ~hundreds-of-us runtime.
     initial begin
         #(T_CLK * 500_000);
         $fatal(1, "tb_dense_group: watchdog timeout");
@@ -475,4 +385,4 @@ module tb_dense_group
 endmodule : tb_dense_group
 
 `default_nettype wire
-`endif // ARCHBETTER_TB_DENSE_GROUP_SV
+`endif

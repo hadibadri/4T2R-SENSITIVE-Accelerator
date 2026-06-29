@@ -1,45 +1,13 @@
-// -----------------------------------------------------------------------------
-// tb_tlmm_driver.sv
-//
-// Phase-5b unit testbench for tlmm_driver.
-//
-// What it covers:
-//   * Directed K=1 op with known activations + weights; verify tile partials
-//     match a golden model computed from the same (activations, weights).
-//   * K=4 op: same activations, sequence of 4 different weight beats.
-//   * K=8 with random backpressure on the sparse_tile's OUT port (via
-//     the tile itself; we only throttle by not asserting the dispatcher's
-//     busy drop until after the last OUT has landed - the driver keeps
-//     o_ready = busy so the sparse_tile actually drives o_valid and the
-//     driver sinks it unconditionally).
-//   * Two back-to-back ops at different base_addrs.
-//   * tlmm_issue_if invariants (start is a pulse, done is a pulse, busy
-//     spans the op, done co-falls with busy).
-//
-// TB roles:
-//   * dispatcher (tlmm_issue_if.disp): we drive start / k_cnt / busy; we
-//     sample tlmm.done.
-//   * memory_manager (pingpong_if.mem_mgr): 1-cycle UltraRAM fake with
-//     deterministic contents.
-//   * real sparse_tile is instantiated to consume ctrl.
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 
 module tb_tlmm_driver;
     import types_pkg::*;
-
-    // -------------------------------------------------------------------------
-    // Clock / reset
-    // -------------------------------------------------------------------------
     localparam time CLK_PERIOD = 10ns;
     logic clk = 1'b0;
     logic rst_n;
     initial forever #(CLK_PERIOD/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // Local widths (mirror RTL)
-    // -------------------------------------------------------------------------
     localparam int unsigned PP_DATA_W             = 144;
     localparam int unsigned PROG_BITS_PER_WORD    = 96;
     localparam int unsigned COMPUTE_BITS_PER_WORD = 128;
@@ -50,20 +18,10 @@ module tb_tlmm_driver;
     localparam int unsigned WEIGHT_BASE_OFFSET    = PROG_WORDS;
 
     localparam int unsigned URAM_DEPTH_TB = 2048;
-
-    // -------------------------------------------------------------------------
-    // Interfaces
-    // -------------------------------------------------------------------------
     tlmm_issue_if                                                   tlmm (clk, rst_n);
     pingpong_if   #(.ADDR_W(URAM_ADDR_W), .DATA_W(PP_DATA_W))       pp   (clk, rst_n);
     tlmm_ctrl_if                                                    ctrl (clk, rst_n);
-
-    // -------------------------------------------------------------------------
-    // DUT + sparse_tile consumer
-    // -------------------------------------------------------------------------
     logic [URAM_ADDR_W-1:0] base_addr;
-
-    // Phase-8 result bus (Stage 8d): per-lane K-reduction accumulator + valid.
     tlmm_acc_vec_t          dut_result_acc;
     logic                   dut_result_valid;
 
@@ -83,10 +41,6 @@ module tb_tlmm_driver;
         .rst_n (rst_n),
         .ctrl  (ctrl.tile)
     );
-
-    // -------------------------------------------------------------------------
-    // Fake URAM (1-cycle latency)
-    // -------------------------------------------------------------------------
     logic [PP_DATA_W-1:0] mem_q [0:URAM_DEPTH_TB-1];
 
     bank_sel_e          mgr_active_side;
@@ -118,10 +72,6 @@ module tb_tlmm_driver;
         mgr_side_valid  = 1'b1;
         mgr_drain_req   = 1'b0;
     end
-
-    // -------------------------------------------------------------------------
-    // Dispatcher emulation (tlmm_issue_if.disp)
-    // -------------------------------------------------------------------------
     logic                     disp_start;
     logic [MACRO_CNT_W-1:0]   disp_k_cnt;
     logic                     disp_busy;
@@ -129,10 +79,6 @@ module tb_tlmm_driver;
     assign tlmm.start = disp_start;
     assign tlmm.k_cnt = disp_k_cnt;
     assign tlmm.busy  = disp_busy;
-
-    // -------------------------------------------------------------------------
-    // Output scoreboard
-    // -------------------------------------------------------------------------
     typedef struct {
         tlmm_part_vec_t parts;
     } obeat_t;
@@ -175,11 +121,6 @@ module tb_tlmm_driver;
                    $time, label, $signed(got), $signed(exp));
         end
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Golden reference: expected tile partial per lane given one
-    // (activations, weights) pair.
-    // -------------------------------------------------------------------------
     function automatic tlmm_tile_part_t golden_part(
         input tlmm_tile_act_t   acts,
         input tern_tile_t       w_lane
@@ -190,19 +131,11 @@ module tb_tlmm_driver;
             unique case (w_lane[t])
                 TERN_POS : acc += tlmm_tile_part_t'($signed(acts[t]));
                 TERN_NEG : acc -= tlmm_tile_part_t'($signed(acts[t]));
-                default  : ; // 0 or reserved -> no contribution
+                default  : ;
             endcase
         end
         return acc;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // URAM programming helpers.
-    //   prog words: word[0] low96 = mant[0..7], word[1] low96 = mant[8..15].
-    //   compute words: each word's low128 holds 64 ternary weights.
-    //     bit (l*TLMM_TILE*2 + t*2 +: 2) in the ASSEMBLED 512b vector
-    //     -> which URAM word and which bit within that word.
-    // -------------------------------------------------------------------------
     function automatic void program_acts(
         input logic [URAM_ADDR_W-1:0] op_base,
         input tlmm_tile_act_t         acts
@@ -240,8 +173,6 @@ module tb_tlmm_driver;
             mem_q[w_base + k] = word;
         end
     endfunction
-
-    // Build a random activation tile.
     function automatic tlmm_tile_act_t rand_acts(input int seed_v);
         tlmm_tile_act_t a;
         for (int i = 0; i < int'(TLMM_TILE); i++) begin
@@ -250,14 +181,12 @@ module tb_tlmm_driver;
         end
         return a;
     endfunction
-
-    // Build a random ternary weight beat.
     function automatic tern_lane_tiles_t rand_w_beat();
         tern_lane_tiles_t w;
         for (int l = 0; l < int'(TLMM_LANES); l++) begin
             for (int t = 0; t < int'(TLMM_TILE); t++) begin
                 automatic int r;
-                r = $urandom_range(0, 2);   // 0 -> 0, 1 -> +1, 2 -> -1
+                r = $urandom_range(0, 2);
                 unique case (r)
                     0:       w[l][t] = TERN_ZERO;
                     1:       w[l][t] = TERN_POS;
@@ -267,10 +196,6 @@ module tb_tlmm_driver;
         end
         return w;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Op runner.
-    // -------------------------------------------------------------------------
     task automatic run_op (
         input logic [URAM_ADDR_W-1:0] op_base,
         input int                     op_k,
@@ -281,8 +206,6 @@ module tb_tlmm_driver;
         int prev_obs_size;
         tlmm_acc_vec_t res_snap;
         tlmm_acc_t     exp_acc_arr [TLMM_LANES];
-
-        // Program memory.
         program_acts(op_base, acts);
         for (int k = 0; k < op_k; k++) begin
             program_w_beat(op_base, k, wbeats[k]);
@@ -292,32 +215,16 @@ module tb_tlmm_driver;
         base_addr  = op_base;
         disp_k_cnt = MACRO_CNT_W'(op_k);
         prev_obs_size = obs_q.size();
-
-        // Pulse start + hold busy.
         disp_busy  <= 1'b1;
         disp_start <= 1'b1;
         @(posedge clk);
         disp_start <= 1'b0;
-
-        // Wait for done. Drop busy in the SAME cycle done is observed
-        // (the tlmm_issue_if contract is "done co-falls with busy"); if we
-        // hold busy=1 for an extra cycle, the driver's S_IDLE branch sees
-        // state_q=S_IDLE && tlmm.busy=1 the cycle after S_DONE and re-fires
-        // the op-start load — spawning a phantom op that reloads k_cnt_q
-        // with the previous op's value and runs a stray fetch/prog/compute
-        // pass against whatever base_addr/mem state happens to be live.
         while (!tlmm.done) @(posedge clk);
-        // done co-fires with result_valid; result_acc is final and stable this
-        // cycle (the bank is not cleared until the next op's PROG_FETCH entry).
-        // Snapshot it here, before dropping busy.
         check_eq_part(tlmm_tile_part_t'(dut_result_valid), tlmm_tile_part_t'(1'b1),
                       $sformatf("%s result_valid co-fires with done", label));
         res_snap = dut_result_acc;
         disp_busy <= 1'b0;
         @(posedge clk);
-
-        // Compare OUT beats vs golden, and accumulate the expected per-lane
-        // K-reduction (sign-extend each 17b tile_partial to 32b, sum over beats).
         for (int l = 0; l < int'(TLMM_LANES); l++) exp_acc_arr[l] = '0;
         for (int k = 0; k < op_k; k++) begin
             obeat_t got;
@@ -330,27 +237,16 @@ module tb_tlmm_driver;
                 exp_acc_arr[l] = exp_acc_arr[l] + tlmm_acc_t'($signed(exp_part));
             end
         end
-
-        // result_acc must equal the whole-op K-reduction per lane.
         for (int l = 0; l < int'(TLMM_LANES); l++) begin
             check_eq_acc(res_snap[l], exp_acc_arr[l],
                          $sformatf("%s result_acc.lane[%0d]", label, l));
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Watchdog
-    // -------------------------------------------------------------------------
     initial begin
         #200us;
         $fatal(1, "tb_tlmm_driver: watchdog timeout");
     end
-
-    // -------------------------------------------------------------------------
-    // Stimulus
-    // -------------------------------------------------------------------------
     initial begin
-        // Reset
         rst_n        = 1'b0;
         disp_start   = 1'b0;
         disp_busy    = 1'b0;
@@ -361,15 +257,12 @@ module tb_tlmm_driver;
         repeat (8) @(posedge clk);
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
-
-        // Test 1: K=1 with deterministic activations + all-POS weights,
-        //         partial per lane = sum of activations.
         begin
             tlmm_tile_act_t   acts;
             tern_lane_tiles_t wbeats [];
             wbeats = new[1];
             for (int i = 0; i < int'(TLMM_TILE); i++) begin
-                acts[i] = bfp12_mant_t'(i + 1);  // 1..16
+                acts[i] = bfp12_mant_t'(i + 1);
             end
             for (int l = 0; l < int'(TLMM_LANES); l++) begin
                 for (int t = 0; t < int'(TLMM_TILE); t++) begin
@@ -378,8 +271,6 @@ module tb_tlmm_driver;
             end
             run_op(URAM_ADDR_W'(0), 1, acts, wbeats, "T1.K1_all_pos");
         end
-
-        // Test 2: K=1 with mixed +/-/0 weights on one lane, zero on others.
         begin
             tlmm_tile_act_t   acts;
             tern_lane_tiles_t wbeats [];
@@ -400,8 +291,6 @@ module tb_tlmm_driver;
             end
             run_op(URAM_ADDR_W'(64), 1, acts, wbeats, "T2.K1_mixed");
         end
-
-        // Test 3: K=4, random.
         begin
             tlmm_tile_act_t   acts;
             tern_lane_tiles_t wbeats [];
@@ -410,8 +299,6 @@ module tb_tlmm_driver;
             for (int k = 0; k < 4; k++) wbeats[k] = rand_w_beat();
             run_op(URAM_ADDR_W'(128), 4, acts, wbeats, "T3.K4_rand");
         end
-
-        // Test 4: K=8, random, different base.
         begin
             tlmm_tile_act_t   acts;
             tern_lane_tiles_t wbeats [];
@@ -420,8 +307,6 @@ module tb_tlmm_driver;
             for (int k = 0; k < 8; k++) wbeats[k] = rand_w_beat();
             run_op(URAM_ADDR_W'(512), 8, acts, wbeats, "T4.K8_rand");
         end
-
-        // Test 5: two back-to-back ops at different bases.
         begin
             tlmm_tile_act_t   actsA, actsB;
             tern_lane_tiles_t wbeatsA [], wbeatsB [];
@@ -434,8 +319,6 @@ module tb_tlmm_driver;
             run_op(URAM_ADDR_W'(1024), 3, actsA, wbeatsA, "T5a.K3");
             run_op(URAM_ADDR_W'(1280), 5, actsB, wbeatsB, "T5b.K5");
         end
-
-        // -- Summary
         repeat (8) @(posedge clk);
         if (n_errors == 0) begin
             $display("=========================================================");

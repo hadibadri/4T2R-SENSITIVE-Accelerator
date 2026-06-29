@@ -1,48 +1,21 @@
-// -----------------------------------------------------------------------------
-// tb_archbetter_soc_top.sv  (C3.3 — full layer end-to-end through the SoC wrapper)
-//
-// This is the C2b deliverable folded into C3: a complete dense (+sparse) layer
-// runs end-to-end through archbetter_soc_top against MODELED DRAM LATENCY, with
-// NO direct host poking of the core — everything goes through:
-//   * the narrow 32-bit cfg loader (program + descriptors + bases + start), and
-//   * the AXI4 memory seam (axi4_read/write_adapter <-> axi4_dram_model).
-//
-// Flow:
-//   1. Build the same capacity-bounded sub-layer as tb_archbetter_core
-//      (4x2 tiles, K=1, OP_GEMM_BATCH T=8) + a small FFN.
-//   2. PRELOAD the DRAM model's backing store with the dense + sparse images at
-//      byte addresses base + beat*BEAT_BYTES (the seam's addressing).
-//   3. Drive cfg to load the descriptor table, imem program, and URAM bases,
-//      then pulse start.
-//   4. Wait for program_done. The weights/activations were fetched from DRAM via
-//      the read seam; OP_ST_OUT drained the dense result to DRAM via the write
-//      seam.
-//   5. VERIFY by reading the result back from the DRAM model at STOUT_DRAM_BASE
-//      and bit-comparing against the golden — proving BOTH AXI directions and the
-//      whole control/compute path through the wrapper.
-//
-// SIM_CLOCK_BYPASS=1: the functional path runs on the board clock directly (the
-// real MMCM is exercised at synth/impl, C5).
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 
 module tb_archbetter_soc_top;
     import types_pkg::*;
 
-    localparam time         T_CLK      = 10ns;     // 100 MHz board clock
+    localparam time         T_CLK      = 10ns;
     localparam int unsigned IMEM_DEPTH = 64;
     localparam int unsigned AXI_DATA_W = 128;
     localparam int unsigned AXI_ID_W   = 4;
-    localparam int unsigned BEAT_BYTES = AXI_DATA_W / 8;   // 16
-
-    // ---- Sub-layer geometry (mirrors tb_archbetter_core) --------------------
-    localparam int COLS  = DENSE_ARRAY_COLS;       // 128
-    localparam int GRS   = DENSE_GROUP_ROWS;       // 16
-    localparam int PHYS_COLS = DENSE_PHYS_COLS;    // 32
+    localparam int unsigned BEAT_BYTES = AXI_DATA_W / 8;
+    localparam int COLS  = DENSE_ARRAY_COLS;
+    localparam int GRS   = DENSE_GROUP_ROWS;
+    localparam int PHYS_COLS = DENSE_PHYS_COLS;
     localparam int ROW_CNT = 4, COL_CNT = 2, K_TILE = 1;
-    localparam int USED_ROWS = ROW_CNT * GRS;       // 64
-    localparam int USED_COLS = COL_CNT * PHYS_COLS;  // 64
+    localparam int USED_ROWS = ROW_CNT * GRS;
+    localparam int USED_COLS = COL_CNT * PHYS_COLS;
     localparam int WORDS_PER_TILE_CASC = 64;
     localparam int NATIVE_PER_TILE     = 2 * WORDS_PER_TILE_CASC;
     localparam int MAX_TILE_LINEAR     = (ROW_CNT-1)*int'(DENSE_LOGICAL_TILE_COLS) + (COL_CNT-1);
@@ -58,30 +31,18 @@ module tb_archbetter_soc_top;
     localparam logic [DRAM_ADDR_W-1:0] DENSE_DRAM_BASE  = 'h1000_0000;
     localparam logic [DRAM_ADDR_W-1:0] SPARSE_DRAM_BASE = 'h2000_0000;
     localparam logic [DRAM_ADDR_W-1:0] STOUT_DRAM_BASE  = 'h3000_0000;
-
-    // NoC multicast: drops 0..7, multicast.
     localparam noc_mask_t   TGT_MASK    = noc_mask_t'(64'h0000_0000_0000_00FF);
     localparam logic [31:0] TGT_MASK_LO = TGT_MASK[31:0];
     localparam logic [31:0] TGT_MASK_HI = TGT_MASK[63:32];
     localparam logic [NOC_PATH_ID_W-1:0] TGT_HANDLE = '0;
-
-    // ---- cfg register map (mirrors soc_ctrl_loader) -------------------------
     localparam logic [7:0] A_CTRL=8'h00, A_IMEM_ADDR=8'h10, A_IMEM_LO=8'h14,
         A_IMEM_HI=8'h18, A_DESC_ADDR=8'h20, A_DESC_LO=8'h24, A_DESC_HI=8'h28,
         A_BASE_DW=8'h30, A_BASE_DA=8'h34, A_BASE_TL=8'h38, A_BASE_OC=8'h3C,
         A_BASE_SO=8'h40;
     localparam int unsigned DESC_W = $bits(csd_descriptor_t);
-
-    // -------------------------------------------------------------------------
-    // Clock / reset.
-    // -------------------------------------------------------------------------
     logic clk_in, ext_rst_n;
     initial clk_in = 1'b0;
     always #(T_CLK/2) clk_in = ~clk_in;
-
-    // -------------------------------------------------------------------------
-    // DUT + DRAM model.
-    // -------------------------------------------------------------------------
     logic        cfg_we;
     logic [7:0]  cfg_addr;
     logic [31:0] cfg_wdata, cfg_rdata;
@@ -106,20 +67,11 @@ module tb_archbetter_soc_top;
         .AXI_DATA_W(AXI_DATA_W), .AXI_ADDR_W(DRAM_ADDR_W), .AXI_ID_W(AXI_ID_W),
         .RD_LATENCY(8), .WR_LATENCY(4)
     ) u_model (.clk(clk_in), .rst_n(ext_rst_n), .axi(axi.slave));
-
-    // -------------------------------------------------------------------------
-    // AXI bus monitors (localize read-fill vs compute vs write-drain).
-    // -------------------------------------------------------------------------
-    // The result is verified DIRECTLY from the AXI write-data bus (the real
-    // memory-seam interface contract). DRAM-readback via the model's associative
-    // array is unreliable under XSim for cells written by the model's always_ff
-    // engine vs. a hierarchical TB function read — so we capture the W beats the
-    // accelerator actually drives out the seam and compare them to golden.
     int unsigned            mon_rd_beats, mon_wr_beats;
     logic [AXI_DATA_W-1:0]  mon_first_rd;
     logic [DRAM_ADDR_W-1:0] mon_aw_addr_l, mon_first_waddr;
     logic                   mon_got_rd;
-    logic [AXI_DATA_W-1:0]  mon_wd_arr [COLS];   // captured ST_OUT write beats (in order)
+    logic [AXI_DATA_W-1:0]  mon_wd_arr [COLS];
     always_ff @(posedge clk_in) begin
         if (!ext_rst_n) begin
             mon_rd_beats <= 0; mon_wr_beats <= 0; mon_got_rd <= 0;
@@ -137,19 +89,11 @@ module tb_archbetter_soc_top;
             end
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Scoreboard.
-    // -------------------------------------------------------------------------
     int unsigned n_checks, n_errors;
     function automatic void chk(input bit cond, input string msg);
         n_checks++;
         if (!cond) begin n_errors++; $error("tb_archbetter_soc_top: FAIL — %s", msg); end
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Reference data + images (same construction as tb_archbetter_core).
-    // -------------------------------------------------------------------------
     bfp12_mant_t           weights_ref [128][128];
     bfp12_mant_t           x_vec       [USED_ROWS];
     array_acc_t [COLS-1:0] y_expected;
@@ -274,10 +218,6 @@ module tb_archbetter_soc_top;
         for (int j = 0; j < 4; j++) sparse_native[j] = tile_words[j];
         for (int b = 0; b < K_FFN; b++) pack_compute_beat(ffn_wbeats[b], sparse_native, 4 + b*8);
     endtask
-
-    // -------------------------------------------------------------------------
-    // Macro-instruction builders (mirror tb_archbetter_core).
-    // -------------------------------------------------------------------------
     function automatic logic [MACRO_WORD_W-1:0] mk_instr(
         input macro_opc_e opc, input logic [7:0] tile_id,
         input logic [7:0] path_id_field, input logic [31:0] low32
@@ -308,10 +248,6 @@ module tb_archbetter_soc_top;
     function automatic logic [31:0] mk_kcnt_payload(input int k_cnt);
         logic [31:0] p; p = '0; p[21:12] = k_cnt[9:0]; return p;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // cfg-bus drivers.
-    // -------------------------------------------------------------------------
     task automatic cfg_w(input logic [7:0] a, input logic [31:0] d);
         @(negedge clk_in); cfg_we = 1'b1; cfg_addr = a; cfg_wdata = d;
         @(negedge clk_in); cfg_we = 1'b0;
@@ -334,10 +270,6 @@ module tb_archbetter_soc_top;
         cfg_w(A_DESC_LO, dv[31:0]);
         cfg_w(A_DESC_HI, 32'(dv[DESC_W-1:32]));
     endtask
-
-    // -------------------------------------------------------------------------
-    // Main.
-    // -------------------------------------------------------------------------
     int waited;
     initial begin : main
         n_checks = 0; n_errors = 0;
@@ -345,15 +277,10 @@ module tb_archbetter_soc_top;
         ext_rst_n = 1'b0;
         repeat (8) @(posedge clk_in);
         ext_rst_n = 1'b1;
-        // Wait for the wrapper's reset sync to release (locked + cdc depth).
         repeat (16) @(posedge clk_in);
-
-        // ---- STAGE 0: build vectors + golden + images ----------------------
         $display("[%0t] STAGE 0: build images (%0dx%0d tiles, K=%0d, T=%0d)",
                  $time, ROW_CNT, COL_CNT, K_TILE, BATCH_TOK);
         build_weights_and_x(); build_golden(); build_dense_image(); build_sparse_image();
-
-        // ---- STAGE 1: PRELOAD the DRAM model (byte addr = base + beat*16) ---
         for (int i = 0; i < DENSE_NATIVE; i++)
             u_model.backdoor_write(DRAM_ADDR_W'(DENSE_DRAM_BASE + DRAM_ADDR_W'(i*BEAT_BYTES)),
                                    AXI_DATA_W'(dense_native[i]));
@@ -362,10 +289,6 @@ module tb_archbetter_soc_top;
                                    AXI_DATA_W'(sparse_native[i]));
         $display("[%0t] STAGE 1: DRAM preloaded (dense %0d + sparse %0d beats)",
                  $time, DENSE_NATIVE, SPARSE_NATIVE_BEATS);
-
-        // ---- BISECTION DIAGNOSTIC: did the backdoor preload populate the model?
-        // If these fail, the preload mechanism is broken (not the data path);
-        // if they pass, the read/compute/write seam is the suspect.
         chk(u_model.backdoor_read(DENSE_DRAM_BASE) === AXI_DATA_W'(dense_native[0]),
             $sformatf("preload[dense 0]: got %h exp %h",
                       u_model.backdoor_read(DENSE_DRAM_BASE), AXI_DATA_W'(dense_native[0])));
@@ -375,14 +298,10 @@ module tb_archbetter_soc_top;
                       u_model.backdoor_read(DRAM_ADDR_W'(DENSE_DRAM_BASE
                           + DRAM_ADDR_W'(WEIGHT_NATIVE*BEAT_BYTES))),
                       AXI_DATA_W'(dense_native[WEIGHT_NATIVE])));
-
-        // ---- STAGE 2: descriptors via cfg ----------------------------------
         cfg_w(A_DESC_ADDR, 32'd0);
-        desc_push(1'b0, URAM_ADDR_W'(0), DENSE_DRAM_BASE,  DRAM_LEN_W'(DENSE_NATIVE));        // tile 0
-        desc_push(1'b1, URAM_ADDR_W'(0), SPARSE_DRAM_BASE, DRAM_LEN_W'(SPARSE_NATIVE_BEATS)); // tile 1
-        desc_push(1'b0, URAM_ADDR_W'(0), STOUT_DRAM_BASE,  DRAM_LEN_W'(COLS));                // tile 2 (ST_OUT)
-
-        // ---- STAGE 3: imem program via cfg ---------------------------------
+        desc_push(1'b0, URAM_ADDR_W'(0), DENSE_DRAM_BASE,  DRAM_LEN_W'(DENSE_NATIVE));
+        desc_push(1'b1, URAM_ADDR_W'(0), SPARSE_DRAM_BASE, DRAM_LEN_W'(SPARSE_NATIVE_BEATS));
+        desc_push(1'b0, URAM_ADDR_W'(0), STOUT_DRAM_BASE,  DRAM_LEN_W'(COLS));
         cfg_w(A_IMEM_ADDR, 32'd0);
         imem_push(mk_instr_flags(OP_LD_W_URAM, 8'h00, 8'h00, 12'h000));
         imem_push(mk_instr_flags(OP_LD_W_URAM, 8'h01, 8'h00, 12'h000 | (1 << FLG_IS_SPARSE)));
@@ -399,15 +318,11 @@ module tb_archbetter_soc_top;
         imem_push(mk_instr(OP_FFN_TLMM,   8'h00, 8'h00, mk_kcnt_payload(K_FFN)));
         imem_push(mk_instr_flags(OP_ST_OUT, 8'h02, 8'h00, 12'h000));
         imem_push(mk_instr_flags(OP_EOP,    8'h00, 8'h00, 12'h000));
-
-        // ---- STAGE 4: URAM bases via cfg -----------------------------------
         cfg_w(A_BASE_DW, 32'd0);
         cfg_w(A_BASE_DA, 32'(ACT_CASC_BASE));
         cfg_w(A_BASE_TL, 32'd0);
         cfg_w(A_BASE_OC, 32'd0);
         cfg_w(A_BASE_SO, 32'd256);
-
-        // ---- STAGE 5: start ------------------------------------------------
         $display("[%0t] STAGE 5: start", $time);
         cfg_w(A_CTRL, 32'h1);
 
@@ -417,10 +332,7 @@ module tb_archbetter_soc_top;
             if (waited > 400_000) $fatal(1, "tb_archbetter_soc_top: program_done never asserted");
         end
         $display("[%0t] program_done after %0d cycles", $time, waited);
-        // Let any trailing AXI write traffic (ST_OUT) fully settle in the model.
         repeat (500) @(posedge clk_in);
-
-        // ---- STAGE 6: verify the dense result FROM DRAM --------------------
         $display("[%0t] STAGE 6: verify the layer end-to-end over the AXI seam", $time);
         $display("  [mon] AXI read  beats = %0d ; first rdata[71:0] = %h (exp dense_native[0] = %h)",
                  mon_rd_beats, mon_first_rd[DRAM_BEAT_W-1:0], dense_native[0]);
@@ -428,22 +340,16 @@ module tb_archbetter_soc_top;
                  mon_wr_beats, mon_first_waddr, STOUT_DRAM_BASE);
 
         chk(program_done === 1'b1, "program_done not asserted");
-
-        // ---- Read seam: correct fill data + beat count ---------------------
         chk(mon_first_rd[DRAM_BEAT_W-1:0] === dense_native[0],
             $sformatf("read-fill first beat: got %h exp %h",
                       mon_first_rd[DRAM_BEAT_W-1:0], dense_native[0]));
         chk(mon_rd_beats == (DENSE_NATIVE + SPARSE_NATIVE_BEATS),
             $sformatf("read-fill beats: got %0d exp %0d",
                       mon_rd_beats, DENSE_NATIVE + SPARSE_NATIVE_BEATS));
-
-        // ---- Write seam: ST_OUT drains the dense result to STOUT ------------
         chk(mon_first_waddr === STOUT_DRAM_BASE,
             $sformatf("ST_OUT base addr: got %h exp %h", mon_first_waddr, STOUT_DRAM_BASE));
         chk(mon_wr_beats == COLS,
             $sformatf("ST_OUT write beats: got %0d exp %0d", mon_wr_beats, COLS));
-
-        // ---- The dense result, taken straight off the AXI write bus --------
         for (int c = 0; c < COLS; c++) begin
             automatic array_acc_t got = array_acc_t'(mon_wd_arr[c][ARRAY_ACC_W-1:0]);
             chk(got === y_expected[c],

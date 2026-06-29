@@ -1,23 +1,4 @@
-// -----------------------------------------------------------------------------
-// tb_dense_pe.sv
-//
-// Directed + random testbench for dense_pe. Each "reduction" drives K
-// activations against a stationary weight, pulses acc_snap after the drain
-// cycle, and compares the snapshotted INT32 sum against a pure-SV reference.
-//
-// Directed cases:
-//   * K=1  weight=+1      -- simplest passthrough
-//   * K=16 weight=-1      -- matches BFP12_BLK, exercises sign flip
-//   * K=64 weight=max     -- max-magnitude saturation check on acc headroom
-//
-// Random phase:
-//   * N_RANDOM_REDUCTIONS reductions
-//   * K ~ U[1, K_MAX]
-//   * weight and activations uniformly random in signed 12b range
-//
-// All reductions run back-to-back on the same PE, rewriting the weight before
-// each one. This indirectly exercises the w_we vs a_valid mutex contract.
-// -----------------------------------------------------------------------------
+
 `ifndef ARCHBETTER_TB_DENSE_PE_SV
 `define ARCHBETTER_TB_DENSE_PE_SV
 `default_nettype none
@@ -26,17 +7,9 @@
 module tb_dense_pe
     import types_pkg::*;
 ();
-
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
     localparam time T_CLK               = 10ns;
     localparam int  N_RANDOM_REDUCTIONS = 500;
     localparam int  K_MAX               = 64;
-
-    // -------------------------------------------------------------------------
-    // DUT nets
-    // -------------------------------------------------------------------------
     logic         clk, rst_n;
     bfp12_mant_t  a_in;
     logic         a_valid;
@@ -65,25 +38,13 @@ module tb_dense_pe
         .acc_out       (acc_out),
         .acc_out_valid (acc_out_valid)
     );
-
-    // -------------------------------------------------------------------------
-    // Clock
-    // -------------------------------------------------------------------------
     initial clk = 1'b0;
     always  #(T_CLK/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // Snapshot capture — one-shot per reduction, armed by the caller.
-    // -------------------------------------------------------------------------
     dense_acc_t snapped;
     logic       snap_seen;
-    logic       snap_clr;   // task-driven 1-cycle clear (keeps snap_seen 1-driver)
+    logic       snap_clr;
     int         n_reductions;
     int         n_errors;
-
-    // snap_seen driven only here (single process); the reduction task clears it
-    // via the clocked snap_clr handshake, not a direct write — removes the
-    // VRFC-10-3818/10-2921 multi-driver warning the v1 pattern carried.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             snap_seen <= 1'b0;
@@ -91,23 +52,16 @@ module tb_dense_pe
             if (snap_clr) snap_seen <= 1'b0;
             if (acc_out_valid) begin
                 snapped   <= acc_out;
-                snap_seen <= 1'b1;   // valid wins a same-cycle race with clr
+                snap_seen <= 1'b1;
             end
         end
     end
-
-    // v2 (CONTINUOUS) capture: record every per-beat acc_out in stream order.
     dense_acc_t cont_cap [$];
     logic       cont_capturing;
     always_ff @(posedge clk) begin
         if (rst_n && cont_capturing && acc_out_valid)
             cont_cap.push_back(acc_out);
     end
-
-    // -------------------------------------------------------------------------
-    // Stimulus primitives — respect the w_we vs a_valid mutex, and observe
-    // the fused-MACC drain rule before acc_snap (3 cycles minimum; we over-drain).
-    // -------------------------------------------------------------------------
     task automatic drive_weight(input bfp12_mant_t w);
         @(posedge clk);
         w_in <= w;
@@ -138,19 +92,10 @@ module tb_dense_pe
         a_in    <= '0;
         a_valid <= 1'b0;
         acc_clr <= 1'b0;
-
-        // Drain: the fused MACC (A1+A2+MREG+PREG) is 4 cycles deep. Once a_valid
-        // drops, the DSP P register HOLDS the completed sum, so a generous drain
-        // is always safe (and insensitive to the exact pipeline depth). 4 idle
-        // cycles + the snap cycle = 5 >= 4-cycle latency, so this stays valid.
         repeat (4) @(posedge clk);
-
-        // Snap.
         acc_snap <= 1'b1;
         @(posedge clk);
         acc_snap <= 1'b0;
-
-        // Let acc_out_valid pulse through the capture always_ff.
         @(posedge clk);
         @(posedge clk);
     endtask
@@ -166,10 +111,6 @@ module tb_dense_pe
                    $time, label, snapped, expected, snapped - expected);
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Directed
-    // -------------------------------------------------------------------------
     task automatic run_directed();
         dense_acc_t expected;
 
@@ -209,33 +150,23 @@ module tb_dense_pe
             check_reduction(expected, "K=64 max-*max-");
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // v2 continuous snap: stream T K=1 token-beats at II=1 with acc_clr=1 on
-    // EVERY beat (each beat is a fresh LOAD = an independent token). The PE must
-    // emit one result per beat, in order, each = a[t]*w. This is the prefill
-    // compute-bound path (no per-token drain). Validates the +5 PE result
-    // latency and the do_snap-based valid contract.
-    // -------------------------------------------------------------------------
     task automatic run_continuous(input bfp12_mant_t w, input bfp12_mant_t acts[$],
                                   input string label);
         int unsigned T = acts.size();
         stream_mode = GEMM_SNAP_CONTINUOUS;
-        drive_weight(w);                 // stationary weight (no beats during load)
+        drive_weight(w);
         cont_cap.delete();
         cont_capturing = 1'b1;
         @(posedge clk);
         for (int t = 0; t < int'(T); t++) begin
             a_in    <= acts[t];
             a_valid <= 1'b1;
-            acc_clr <= 1'b1;             // fresh K=1 LOAD every beat (new token)
+            acc_clr <= 1'b1;
             @(posedge clk);
         end
         a_in    <= '0;
         a_valid <= 1'b0;
         acc_clr <= 1'b0;
-        // Drain the fused-MACC pipe so the final beats' results are captured
-        // (last beat emerges DENSE_MACC_LAT + PE snap reg cycles after it enters).
         repeat (DENSE_MACC_LAT + 4) @(posedge clk);
         cont_capturing = 1'b0;
 
@@ -254,7 +185,7 @@ module tb_dense_pe
                 end
             end
         end
-        stream_mode = GEMM_SNAP_PER_TOKEN;   // restore v1 default
+        stream_mode = GEMM_SNAP_PER_TOKEN;
     endtask
 
     task automatic run_continuous_cases();
@@ -278,10 +209,6 @@ module tb_dense_pe
             run_continuous(12'sh7FF, acts, "cont T=16 wmax");
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Random
-    // -------------------------------------------------------------------------
     task automatic run_random();
         dense_acc_t expected;
         $display("[%0t] RANDOM: %0d reductions, K ~ U[1, %0d]",
@@ -296,10 +223,6 @@ module tb_dense_pe
             check_reduction(expected, $sformatf("rand r=%0d K=%0d", r, K));
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Main
-    // -------------------------------------------------------------------------
     initial begin
         rst_n        = 1'b0;
         a_in         = '0;
@@ -314,8 +237,6 @@ module tb_dense_pe
         snap_clr     = 1'b0;
         n_reductions = 0;
         n_errors     = 0;
-        // snap_seen / snapped are driven solely by the capture always_ff
-        // (snap_seen reset via !rst_n) — no init write keeps them single-driver.
 
         repeat (5) @(posedge clk);
         rst_n <= 1'b1;
@@ -338,8 +259,6 @@ module tb_dense_pe
 
         $finish;
     end
-
-    // Watchdog: 500us upper bound on the expected ~200us runtime.
     initial begin
         #(T_CLK * 50_000);
         $fatal(1, "tb_dense_pe: watchdog timeout");
@@ -348,4 +267,4 @@ module tb_dense_pe
 endmodule : tb_dense_pe
 
 `default_nettype wire
-`endif // ARCHBETTER_TB_DENSE_PE_SV
+`endif

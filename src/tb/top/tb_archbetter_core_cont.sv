@@ -1,82 +1,39 @@
-// -----------------------------------------------------------------------------
-// tb_archbetter_core_cont.sv  (R6.5b — CONTINUOUS distinct-token end-to-end)
-//
-// The v2 prefill capstone at the core level: ONE continuous OP_GEMM_BATCH
-// (FLG_GEMM_CONTINUOUS) streams T DISTINCT token activations through each tile's
-// resident weights at II=1, and the array drains T DISTINCT outputs. This proves
-// the whole v2 path end-to-end through archbetter_core:
-//   dispatcher continuous walker (R6.4) -> act streamer per-token addressing
-//   (R6.5a) -> dense_array tok_out pipeline + bank RMW (R6.3) -> per-token drain.
-//
-// vs tb_archbetter_core (the v1 regression): that issues a v1 OP_GEMM_BATCH where
-// all T tokens RE-READ the same band, so every drained output equals one golden.
-// Here each token has its OWN activation vector, so each drained output must equal
-// that token's OWN golden — the distinct-token correctness gate.
-//
-// Layer geometry (capacity-bounded, same sub-layer as tb_archbetter_core):
-//   ROW_CNT x COL_CNT = 4 x 2 tiles, K_TILE = 1 (one beat / token / tile).
-//
-// CONTINUOUS activation layout (the R6.5b piece):
-//   token t, band gr -> cascade ACT_CASC_BASE + gr*2 + t*ACT_TOKEN_STRIDE
-//   (ACT_TOKEN_STRIDE = DENSE_LOGICAL_TILE_ROWS*2 = 16 cascade = 32 native), i.e.
-//   native WEIGHT_NATIVE + t*32 + gr*4. The streamer's base_addr = act_base(gr) =
-//   dense_act_base + gr*2 (k_cnt=1); it steps by token_stride=16 per token.
-//
-// Golden (per token t):
-//   y_t[c] = sum_{gr} sum_{r} x_t[gr*16+r] * W[gr*16+r][c]  for c < USED_COLS.
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 
 module tb_archbetter_core_cont;
     import types_pkg::*;
-
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
     localparam time T_CLK       = 10ns;
     localparam int  IMEM_DEPTH  = 64;
     localparam int  IMEM_ADDR_W = $clog2(IMEM_DEPTH);
 
-    localparam int  COLS  = DENSE_ARRAY_COLS;       // 128
-    localparam int  GRS   = DENSE_GROUP_ROWS;       // 16
-    localparam int  GCS   = DENSE_GROUP_COLS;       // 16
-    localparam int  PHYS_COLS = DENSE_PHYS_COLS;    // 32
+    localparam int  COLS  = DENSE_ARRAY_COLS;
+    localparam int  GRS   = DENSE_GROUP_ROWS;
+    localparam int  GCS   = DENSE_GROUP_COLS;
+    localparam int  PHYS_COLS = DENSE_PHYS_COLS;
     localparam int  PE_ADDR_W = $clog2(DENSE_PE_PER_GROUP);
 
-    localparam int  ROW_CNT = 4;   // logical row-tiles (input bands)
-    localparam int  COL_CNT = 2;   // logical col-tiles (output strips)
-    localparam int  K_TILE  = 1;   // K=1 per token (continuous)
+    localparam int  ROW_CNT = 4;
+    localparam int  COL_CNT = 2;
+    localparam int  K_TILE  = 1;
 
-    localparam int  USED_ROWS = ROW_CNT * GRS;       // 64 input rows
-    localparam int  USED_COLS = COL_CNT * PHYS_COLS;  // 64 output cols
-
-    // R6.7: large-T prefill. BATCH_TOK=64 > BANK_REG_MAX(8) drives archbetter_core's
-    // dense_array_bank onto the BRAM path (in-situ BRAM proof) and gives a compute-
-    // bound util in the T/(256+II*T) regime. Capacity: ACT_CASC_BASE(896) + T*16
-    // must stay <= 2048, so T<=72 fits this 4x2-tile sub-layer; 64 leaves margin.
-    localparam int  BATCH_TOK = 64;  // T distinct tokens per resident weight tile
-
-    // Weight image (same as v1 TB).
+    localparam int  USED_ROWS = ROW_CNT * GRS;
+    localparam int  USED_COLS = COL_CNT * PHYS_COLS;
+    localparam int  BATCH_TOK = 64;
     localparam int  WORDS_PER_TILE_CASC = 64;
-    localparam int  NATIVE_PER_TILE     = 2 * WORDS_PER_TILE_CASC;          // 128
+    localparam int  NATIVE_PER_TILE     = 2 * WORDS_PER_TILE_CASC;
     localparam int  MAX_TILE_LINEAR     = (ROW_CNT-1)*int'(DENSE_LOGICAL_TILE_COLS) + (COL_CNT-1);
     localparam int  WEIGHT_NATIVE       = (MAX_TILE_LINEAR + 1) * NATIVE_PER_TILE;
-
-    // CONTINUOUS activation image: T tokens, each at a token_stride. The streamer's
-    // token_stride (archbetter_core ACT_TOKEN_STRIDE) is DENSE_LOGICAL_TILE_ROWS*2
-    // = 16 cascade words; native is 2x = 32 words/token.
-    localparam int  ACT_TOKEN_STRIDE_CASC   = int'(DENSE_LOGICAL_TILE_ROWS) * 2;   // 16
-    localparam int  ACT_TOKEN_STRIDE_NATIVE = ACT_TOKEN_STRIDE_CASC * 2;           // 32
-    localparam int  ACT_NATIVE          = BATCH_TOK * ACT_TOKEN_STRIDE_NATIVE;     // 256
-    localparam int  ACT_CASC_BASE       = WEIGHT_NATIVE / 2;                       // 896
-    localparam int  DENSE_NATIVE        = WEIGHT_NATIVE + ACT_NATIVE;              // 2048
-
-    // Sparse (FFN) exercise (mirrors tb_archbetter_core, keeps the program flow).
+    localparam int  ACT_TOKEN_STRIDE_CASC   = int'(DENSE_LOGICAL_TILE_ROWS) * 2;
+    localparam int  ACT_TOKEN_STRIDE_NATIVE = ACT_TOKEN_STRIDE_CASC * 2;
+    localparam int  ACT_NATIVE          = BATCH_TOK * ACT_TOKEN_STRIDE_NATIVE;
+    localparam int  ACT_CASC_BASE       = WEIGHT_NATIVE / 2;
+    localparam int  DENSE_NATIVE        = WEIGHT_NATIVE + ACT_NATIVE;
     localparam int  K_FFN               = 3;
     localparam int  SPARSE_NATIVE_BEATS = 4 + 8 * K_FFN;
 
-    localparam int  DENSE_PE_TOTAL = PHYS_COLS * GRS;                       // 512
+    localparam int  DENSE_PE_TOTAL = PHYS_COLS * GRS;
     localparam int  MACS_PER_PASS  = ROW_CNT * COL_CNT * K_TILE * DENSE_PE_TOTAL;
     localparam int  MACS_BATCH     = BATCH_TOK * MACS_PER_PASS;
     localparam real TARGET_FREQ_HZ = 250.0e6;
@@ -101,17 +58,9 @@ module tb_archbetter_core_cont;
     localparam logic [2:0]  TGT_PRIORITY     = 3'd0;
     localparam logic        TGT_IS_MULTICAST = 1'b1;
     localparam logic [NOC_PATH_ID_W-1:0] TGT_HANDLE = '0;
-
-    // -------------------------------------------------------------------------
-    // Clock / reset
-    // -------------------------------------------------------------------------
     logic clk, rst_n;
     initial clk = 1'b0;
     always  #(T_CLK/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // DUT pin set
-    // -------------------------------------------------------------------------
     logic                          start;
     logic                          program_done;
     logic                          imem_we;
@@ -162,10 +111,6 @@ module tb_archbetter_core_cont;
     logic                          dram_wr_wd_valid;
     logic                          dram_wr_wd_ready;
     logic                          dram_wr_wd_last;
-
-    // -------------------------------------------------------------------------
-    // DUT
-    // -------------------------------------------------------------------------
     archbetter_core #(
         .IMEM_DEPTH    (IMEM_DEPTH),
         .N_NOC_SOURCES (1),
@@ -221,12 +166,8 @@ module tb_archbetter_core_cont;
 
     assign d2s_ready_i       = 1'b1;
     assign d2s_almost_full_i = 1'b0;
-
-    // -------------------------------------------------------------------------
-    // Reference data + per-token golden
-    // -------------------------------------------------------------------------
     bfp12_mant_t           weights_ref [128][128];
-    bfp12_mant_t           x_tok       [BATCH_TOK][USED_ROWS];   // DISTINCT per token
+    bfp12_mant_t           x_tok       [BATCH_TOK][USED_ROWS];
     array_acc_t [COLS-1:0] y_exp_tok   [BATCH_TOK];
 
     bfp12_mant_t      ffn_acts   [TLMM_TILE];
@@ -245,11 +186,6 @@ module tb_archbetter_core_cont;
             $error("tb_archbetter_core_cont: CHECK FAILED — %s", msg);
         end
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Per-token drain capture: the continuous drain emits BATCH_TOK y_valid pulses
-    // in token order (bank[0..T-1]); record each output for the distinct golden.
-    // -------------------------------------------------------------------------
     array_acc_t [COLS-1:0] y_drained [BATCH_TOK];
     int unsigned drain_count;
     always_ff @(posedge clk) begin
@@ -260,8 +196,6 @@ module tb_archbetter_core_cont;
             drain_count            <= drain_count + 1;
         end
     end
-
-    // Throughput counters.
     int unsigned     cyc, start_cyc, done_cyc, drained_cyc;
     logic            start_seen, done_seen, drained_seen;
     always_ff @(posedge clk) begin
@@ -276,12 +210,6 @@ module tb_archbetter_core_cont;
                                              begin drained_cyc <= cyc; drained_seen <= 1'b1; end
         end
     end
-
-    // GEMM-phase (compute) instrumentation. Each gemm_bus.beat_fire delivers one
-    // K=1 activation beat to all DENSE_PE_TOTAL PEs = DENSE_PE_TOTAL MACs. The span
-    // from first to last beat covers the weight-scan + stream phase (NOT the
-    // one-time CSD fill or the post-GEMM collector drain), so MACs/span isolates
-    // the compute-bound util in the T/(256+II*T) regime.
     logic        probe_beat;
     assign       probe_beat = dut.gemm_bus.beat_fire;
     int unsigned beat_cnt, beat_first_cyc, beat_last_cyc;
@@ -295,10 +223,6 @@ module tb_archbetter_core_cont;
             beat_cnt      <= beat_cnt + 1;
         end
     end
-
-    // -------------------------------------------------------------------------
-    // BFP12 packers (mirror streamer bit layouts).
-    // -------------------------------------------------------------------------
     function automatic void pack_bfp12_tile(
         input  bfp12_mant_t                mants [BFP12_BLK],
         input  bfp12_exp_t                 shared_exp,
@@ -350,15 +274,10 @@ module tb_archbetter_core_cont;
             dst[base_idx + 2*k + 1] = cw[k][2*URAM_WIDTH_BITS-1:URAM_WIDTH_BITS];
         end
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Builders
-    // -------------------------------------------------------------------------
     task automatic build_weights_and_x();
         for (int r = 0; r < 128; r++)
             for (int c = 0; c < 128; c++)
                 weights_ref[r][c] = bfp12_mant_t'(signed'(((r + c) % 5) - 2));
-        // DISTINCT activation vector per token (token index folded in).
         for (int t = 0; t < BATCH_TOK; t++)
             for (int i = 0; i < USED_ROWS; i++)
                 x_tok[t][i] = bfp12_mant_t'(signed'(((i + 3*t) % 7) - 3));
@@ -378,9 +297,6 @@ module tb_archbetter_core_cont;
             end
         end
     endtask
-
-    // Dense URAM native image: weight tiles, then T DISTINCT token activation
-    // vectors at the continuous stride.
     task automatic build_dense_image();
         bfp12_mant_t                w8       [8];
         logic [URAM_WIDTH_BITS-1:0] lo, hi;
@@ -388,8 +304,6 @@ module tb_archbetter_core_cont;
         logic [URAM_WIDTH_BITS-1:0] beat_out [4];
 
         for (int i = 0; i < DENSE_NATIVE; i++) dense_native[i] = '0;
-
-        // ---- Weights (same raster as the v1 TB) ----------------------------
         for (int gr = 0; gr < ROW_CNT; gr++) begin
             for (int gc = 0; gc < COL_CNT; gc++) begin
                 automatic int tile_linear = gr*int'(DENSE_LOGICAL_TILE_COLS) + gc;
@@ -410,9 +324,6 @@ module tb_archbetter_core_cont;
                 end
             end
         end
-
-        // ---- CONTINUOUS activations: token t, band gr at native
-        //      WEIGHT_NATIVE + t*ACT_TOKEN_STRIDE_NATIVE + gr*4 ----------------
         for (int t = 0; t < BATCH_TOK; t++) begin
             for (int gr = 0; gr < ROW_CNT; gr++) begin
                 for (int r = 0; r < BFP12_BLK; r++) band[r] = x_tok[t][gr*GRS + r];
@@ -443,10 +354,6 @@ module tb_archbetter_core_cont;
         for (int j = 0; j < 4; j++) sparse_native[j] = tile_words[j];
         for (int b = 0; b < K_FFN; b++) pack_compute_beat(ffn_wbeats[b], sparse_native, 4 + b*8);
     endtask
-
-    // -------------------------------------------------------------------------
-    // DRAM read stub (serves dense + sparse images).
-    // -------------------------------------------------------------------------
     typedef enum logic [1:0] { D_IDLE, D_REQ, D_RESP } dram_state_e;
     dram_state_e            dram_state_q;
     logic [DRAM_ADDR_W-1:0] dram_addr_q;
@@ -512,10 +419,6 @@ module tb_archbetter_core_cont;
             endcase
         end
     end
-
-    // -------------------------------------------------------------------------
-    // DRAM write stub (ST_OUT drain) + sparse-collector observer.
-    // -------------------------------------------------------------------------
     int unsigned dram_wr_req_count, dram_wr_beat_count, sparse_wr_count;
     assign dram_wr_req_ready = 1'b1;
     assign dram_wr_wd_ready  = 1'b1;
@@ -528,10 +431,6 @@ module tb_archbetter_core_cont;
             if (sparse_out_wr_en)                       sparse_wr_count++;
         end
     end
-
-    // -------------------------------------------------------------------------
-    // imem / desc helpers
-    // -------------------------------------------------------------------------
     function automatic logic [MACRO_WORD_W-1:0] mk_instr(
         input macro_opc_e opc, input logic [7:0] tile_id,
         input logic [7:0] path_id_field, input logic [31:0] low32
@@ -549,8 +448,6 @@ module tb_archbetter_core_cont;
         w = '0; w[63:58]=opc; w[57:50]=tile_id; w[49:42]=path_id_field; w[11:0]=flags;
         return w;
     endfunction
-
-    // OP_GEMM_BATCH with FLG_GEMM_CONTINUOUS set (v2). tile_id field = T.
     function automatic logic [MACRO_WORD_W-1:0] mk_gemm_batch_cont(
         input logic [7:0] batch_t, input logic [7:0] path_id_field,
         input int row_cnt, input int col_cnt, input int k_cnt
@@ -594,10 +491,6 @@ module tb_archbetter_core_cont;
         @(negedge clk); desc_we = 1'b1; desc_wr_addr = tile_id; desc_wr_data = d;
         @(negedge clk); desc_we = 1'b0;
     endtask
-
-    // -------------------------------------------------------------------------
-    // Main
-    // -------------------------------------------------------------------------
     integer a;
     int     waited;
 
@@ -655,7 +548,6 @@ module tb_archbetter_core_cont;
                                mk_meta_payload(TGT_SRC_NODE, TGT_PRIORITY, TGT_IS_MULTICAST))); a++;
         imem_write(IMEM_ADDR_W'(a), mk_instr(OP_BARRIER,    8'h00, 8'h00, 32'h0)); a++;
         imem_write(IMEM_ADDR_W'(a), mk_instr(OP_COMMIT_NOC, 8'h00, 8'h00, 32'h0)); a++;
-        // R6.5b: ONE CONTINUOUS weight-resident batched GEMM over T distinct tokens.
         imem_write(IMEM_ADDR_W'(a),
                    mk_gemm_batch_cont(8'(BATCH_TOK), 8'h00, ROW_CNT, COL_CNT, K_TILE)); a++;
         imem_write(IMEM_ADDR_W'(a), mk_instr(OP_BARRIER, 8'h00, 8'h00, 32'h0)); a++;
@@ -687,8 +579,6 @@ module tb_archbetter_core_cont;
             end
         end
         repeat (8) @(posedge clk);
-
-        // ---- STAGE 4: checks — each token's drained output == its OWN golden --
         $display("[%0t] STAGE 4: per-token distinct-output checks", $time);
         chk(drain_count == BATCH_TOK,
             $sformatf("drained %0d outputs, expected %0d", drain_count, BATCH_TOK));
@@ -700,8 +590,6 @@ module tb_archbetter_core_cont;
                 chk(bad == 0,
                     $sformatf("token %0d: %0d/%0d cols mismatched its golden", t, bad, COLS));
             end
-            // Prove the tokens are actually DISTINCT (guards against a silent
-            // same-band regression): adjacent tokens' goldens differ.
             begin
                 automatic int distinct_pairs = 0;
                 for (int t = 1; t < BATCH_TOK; t++) begin
@@ -722,15 +610,6 @@ module tb_archbetter_core_cont;
             $sformatf("ST_OUT drained %0d beats, expected %0d", dram_wr_beat_count, COLS));
         chk(sparse_wr_count == TLMM_LANES,
             $sformatf("sparse collector wrote %0d words, expected %0d", sparse_wr_count, TLMM_LANES));
-
-        // ---- STAGE 5: throughput / DSP-util measurement (R6.7) -------------
-        // Two utils, both honest:
-        //   * GEMM-phase  = MACs / (first..last activation-beat span). Isolates the
-        //     compute (weight-scan + stream); the v2 II=~2 streamer caps it near
-        //     T/(256+II*T). This is the architecture's compute-bound number.
-        //   * end-to-end  = MACs / (start..all-tokens-drained). Includes the SERIAL
-        //     one-time CSD fill + the collector-paced drain, which a multi-layer
-        //     ping-pong pipeline overlaps; a conservative single-layer floor.
         begin
             automatic int unsigned prog_cyc  = (done_seen && start_seen)
                                              ? (done_cyc - start_cyc) : 0;

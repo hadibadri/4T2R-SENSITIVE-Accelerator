@@ -1,27 +1,4 @@
-// -----------------------------------------------------------------------------
-// tb_sparse_tile.sv
-//
-// Golden testbench for sparse_tile. Loads TLMM_TILE stationary activations via
-// the PROG channel of tlmm_ctrl_if, streams per-beat ternary weight tiles for
-// TLMM_LANES parallel output neurons via the COMPUTE channel, and verifies the
-// TLMM_LANES tile-partials emitted on the OUT channel against a pure-SV
-// reference ternary dot-product.
-//
-// Directed:
-//   * zero activations + random weights     -> all outputs 0
-//   * all-+1 weights, any activations       -> output = sum(acts)
-//   * all-(-1) weights, any activations     -> output = -sum(acts)
-//   * all-0 weights (TERN_ZERO)             -> output 0
-//   * one-hot lane l: lane l picks act[l]   -> output = acts[l]
-//   * max-magnitude activations + random ternary weights (headroom check)
-//
-// Random:
-//   * N_RAND_EPOCHS epochs. Each epoch loads fresh random activations then
-//     runs N_RAND_BEATS_PER_EPOCH weight beats with random ternary patterns.
-//
-// Backpressure: the TB keeps o_ready high throughout; backpressure corner
-// cases are a separate TB once the tile is proven functionally correct.
-// -----------------------------------------------------------------------------
+
 `ifndef ARCHBETTER_TB_SPARSE_TILE_SV
 `define ARCHBETTER_TB_SPARSE_TILE_SV
 `default_nettype none
@@ -30,18 +7,11 @@
 module tb_sparse_tile
     import types_pkg::*;
 ();
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
     localparam time T_CLK                   = 10ns;
     localparam int  N_RAND_EPOCHS           = 3;
     localparam int  N_RAND_BEATS_PER_EPOCH  = 50;
-    localparam int  PIPE_LATENCY_MAX        = 8;   // guard for watchdog only
+    localparam int  PIPE_LATENCY_MAX        = 8;
     localparam int  WATCHDOG_CLKS           = 500_000;
-
-    // -------------------------------------------------------------------------
-    // DUT nets
-    // -------------------------------------------------------------------------
     logic clk, rst_n;
 
     tlmm_ctrl_if ctrl (.clk(clk), .rst_n(rst_n));
@@ -51,27 +21,13 @@ module tb_sparse_tile
         .rst_n (rst_n),
         .ctrl  (ctrl.tile)
     );
-
-    // -------------------------------------------------------------------------
-    // Clock
-    // -------------------------------------------------------------------------
     initial clk = 1'b0;
     always  #(T_CLK/2) clk = ~clk;
-
-    // -------------------------------------------------------------------------
-    // Reference mirror of the currently-loaded activations + scoreboard queue
-    // -------------------------------------------------------------------------
     bfp12_mant_t acts_ref [TLMM_TILE];
-
-    // One expected tile-partial vector per issued compute beat.
     tlmm_part_vec_t expected_q [$];
 
     int n_beats;
     int n_errors;
-
-    // -------------------------------------------------------------------------
-    // Golden: compute one lane's tile-partial given current acts_ref + weights.
-    // -------------------------------------------------------------------------
     function automatic tlmm_tile_part_t golden_lane_partial(input tern_tile_t w);
         automatic int acc;
         acc = 0;
@@ -80,7 +36,7 @@ module tb_sparse_tile
                 TERN_POS : acc += $signed(acts_ref[i]);
                 TERN_NEG : acc -= $signed(acts_ref[i]);
                 TERN_ZERO: ;
-                default  : ; // TERN_RSVD treated as zero; driver must avoid it
+                default  : ;
             endcase
         end
         return tlmm_tile_part_t'(acc);
@@ -91,10 +47,6 @@ module tb_sparse_tile
         for (int l = 0; l < int'(TLMM_LANES); l++) v[l] = golden_lane_partial(wb[l]);
         return v;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Scoreboard: on every accepted output beat, pop expected & compare.
-    // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst_n && ctrl.o_valid && ctrl.o_ready) begin
             if (expected_q.size() == 0) begin
@@ -113,34 +65,17 @@ module tb_sparse_tile
             end
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Program activations (PROG channel handshake) and mirror into acts_ref.
-    // Waits until w_ready rises (tables coherent) before returning.
-    // -------------------------------------------------------------------------
     task automatic program_activations(input bfp12_mant_t a[TLMM_TILE]);
         tlmm_tile_act_t packed_acts;
         for (int i = 0; i < int'(TLMM_TILE); i++) packed_acts[i] = a[i];
-
-        // Drive the PROG beat.
         @(posedge clk);
         ctrl.prog_acts  <= packed_acts;
         ctrl.prog_valid <= 1'b1;
-
-        // Wait for handshake.
         do @(posedge clk); while (!ctrl.prog_ready);
         ctrl.prog_valid <= 1'b0;
-
-        // Mirror into the reference AFTER the handshake fires.
         for (int i = 0; i < int'(TLMM_TILE); i++) acts_ref[i] = a[i];
-
-        // Wait for the tile to finish filling tables (w_ready rises).
         while (!ctrl.w_ready) @(posedge clk);
     endtask
-
-    // -------------------------------------------------------------------------
-    // Drive one compute (weight) beat. Enqueues the expected partial vector.
-    // -------------------------------------------------------------------------
     task automatic drive_weight_beat(input tern_lane_tiles_t wb);
         tlmm_part_vec_t exp_vec;
         exp_vec = golden_beat(wb);
@@ -150,15 +85,9 @@ module tb_sparse_tile
         @(posedge clk);
         ctrl.w_tiles <= wb;
         ctrl.w_valid <= 1'b1;
-
-        // Wait for handshake.
         do @(posedge clk); while (!ctrl.w_ready);
         ctrl.w_valid <= 1'b0;
     endtask
-
-    // -------------------------------------------------------------------------
-    // Helpers to build activation / weight patterns
-    // -------------------------------------------------------------------------
     function automatic void acts_zero(output bfp12_mant_t a[TLMM_TILE]);
         for (int i = 0; i < int'(TLMM_TILE); i++) a[i] = '0;
     endfunction
@@ -175,8 +104,6 @@ module tb_sparse_tile
         for (int i = 0; i < int'(TLMM_TILE); i++)
             a[i] = bfp12_mant_t'($urandom());
     endfunction
-
-    // Pick a random NON-RESERVED ternary value.
     function automatic tern_weight_e rand_tern();
         automatic int r = $urandom_range(0, 2);
         case (r)
@@ -202,8 +129,6 @@ module tb_sparse_tile
                 wb[l][i] = rand_tern();
         return wb;
     endfunction
-
-    // Lane l picks out position (l mod TLMM_TILE) with +1.
     function automatic tern_lane_tiles_t wb_one_hot();
         tern_lane_tiles_t wb;
         for (int l = 0; l < int'(TLMM_LANES); l++) begin
@@ -212,10 +137,6 @@ module tb_sparse_tile
         end
         return wb;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // Directed
-    // -------------------------------------------------------------------------
     task automatic run_directed();
         bfp12_mant_t a[TLMM_TILE];
 
@@ -249,10 +170,6 @@ module tb_sparse_tile
         program_activations(a);
         for (int b = 0; b < 8; b++) drive_weight_beat(wb_random());
     endtask
-
-    // -------------------------------------------------------------------------
-    // Random
-    // -------------------------------------------------------------------------
     task automatic run_random_epoch(input int epoch_id);
         bfp12_mant_t a[TLMM_TILE];
         acts_random(a);
@@ -262,10 +179,6 @@ module tb_sparse_tile
         for (int b = 0; b < N_RAND_BEATS_PER_EPOCH; b++)
             drive_weight_beat(wb_random());
     endtask
-
-    // -------------------------------------------------------------------------
-    // Drain: wait for every expected partial to have been checked.
-    // -------------------------------------------------------------------------
     task automatic drain_scoreboard();
         int guard = 0;
         while (expected_q.size() > 0) begin
@@ -279,10 +192,6 @@ module tb_sparse_tile
             end
         end
     endtask
-
-    // -------------------------------------------------------------------------
-    // Main
-    // -------------------------------------------------------------------------
     initial begin
         rst_n           = 1'b0;
         ctrl.prog_acts  = '0;
@@ -320,8 +229,6 @@ module tb_sparse_tile
 
         $finish;
     end
-
-    // Watchdog
     initial begin
         #(T_CLK * WATCHDOG_CLKS);
         $fatal(1, "tb_sparse_tile: watchdog timeout");
@@ -330,4 +237,4 @@ module tb_sparse_tile
 endmodule : tb_sparse_tile
 
 `default_nettype wire
-`endif // ARCHBETTER_TB_SPARSE_TILE_SV
+`endif

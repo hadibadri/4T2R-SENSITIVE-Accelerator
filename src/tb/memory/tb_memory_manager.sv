@@ -1,100 +1,34 @@
-// -----------------------------------------------------------------------------
-// tb_memory_manager.sv
-//
-// Directed + random testbench for the memory_manager top of the memory
-// subsystem. Exercises every command path the dispatcher can drive through
-// mem_issue_if, plus the kv_access_if side port.
-//
-// Role of this TB in the verification stack:
-//   * Acts as the dispatcher for mem_issue_if (start pulse + busy level
-//     + done sample).
-//   * Acts as the attention block for kv_access_if (write/read master).
-//   * Acts as the dense + sparse compute cores for the two pingpong_if
-//     instances (issues rd_en/rd_addr, auto-acks drain_req).
-//   * Acts as the off-chip DRAM for csd_dram_if (same stub model as
-//     tb_csd_engine -- payload {DRAM_PATTERN_HI, addr}).
-//
-// Verification strategy for fills:
-//   Two independent checks.
-//   (1) A golden mirror per pool per bank (4 mirrors). On every internal
-//       fill write (sniffed via hierarchical reference to dut.u_{dense,
-//       sparse}_pp) we predict the beat payload from the running
-//       descriptor and assert address + data match.
-//   (2) After the TB issues OP_PINGPONG, the bank that was just filled
-//       becomes the compute side. We read back every touched address and
-//       assert the data returned on pingpong_if.rd_data matches the
-//       mirror.
-//
-// Stages:
-//   STAGE 0  reset quiescent
-//   STAGE 1  directed dense OP_LD_W_URAM + OP_PINGPONG + read-back
-//   STAGE 2  directed sparse OP_LD_A_URAM + OP_PINGPONG + read-back
-//   STAGE 3  OP_ST_OUT end-to-end: pre-load output URAM via out_wr_*, program
-//            an st_out descriptor, issue OP_ST_OUT, verify the captured
-//            wd beats on csd_dram_wr_if match the URAM contents
-//   STAGE 4  KV directed write/read round-trip via kv_access_if
-//   STAGE 5  random: N_DESC descriptors with random is_sparse / uram_base
-//            / dram_base / n_beats; random OP_PINGPONG between them;
-//            random KV writes interleaved with fills (KV is orthogonal
-//            to the CSD data path so it is safe during a fill)
-//   STAGE 6  unsupported-opcode ($warning, 1-cycle done)
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 
 module tb_memory_manager;
     import types_pkg::*;
-
-    // -------------------------------------------------------------------------
-    // Params / constants.
-    // -------------------------------------------------------------------------
-    localparam int unsigned URAM_DATA_W = URAM_WIDTH_BITS;  // 72
-    localparam int unsigned URAM_DEP    = URAM_DEPTH;       // 4096
-    localparam int unsigned URAM_AW     = URAM_ADDR_W;      // 12
-
-    // Same stub payload convention as tb_csd_engine so the data predictor is
-    // a single function of (dram_base, offset).
+    localparam int unsigned URAM_DATA_W = URAM_WIDTH_BITS;
+    localparam int unsigned URAM_DEP    = URAM_DEPTH;
+    localparam int unsigned URAM_AW     = URAM_ADDR_W;
     localparam logic [39:0] DRAM_PATTERN_HI = 40'hCA_FEBA_BECA;
 
     localparam int unsigned N_DESC_RANDOM  = 12;
     localparam int unsigned MAX_BEATS      = 32;
-
-    // -------------------------------------------------------------------------
-    // Clock + reset.
-    // -------------------------------------------------------------------------
     logic clk;
     logic rst_n;
     initial clk = 1'b0;
-    always #5 clk = ~clk;   // 100 MHz
-
-    // -------------------------------------------------------------------------
-    // Interfaces.
-    // -------------------------------------------------------------------------
+    always #5 clk = ~clk;
     mem_issue_if    memif (.clk(clk), .rst_n(rst_n));
     kv_access_if    kvif  (.clk(clk), .rst_n(rst_n));
-    // R6.8b: the dense pp is now a WIDE bank (DENSE_PP_URAM_W = 288 = 4 native
-    // leaves); the sparse pp stays narrow (72b). The dense readback golden below
-    // rebuilds the 288b word from the 4 native fill mirrors.
     pingpong_if #(.ADDR_W(URAM_AW), .DATA_W(DENSE_PP_URAM_W)) dense_pp
         (.clk(clk), .rst_n(rst_n));
     pingpong_if #(.ADDR_W(URAM_AW), .DATA_W(URAM_DATA_W)) sparse_pp
         (.clk(clk), .rst_n(rst_n));
     csd_dram_if     dramif    (.clk(clk), .rst_n(rst_n));
     csd_dram_wr_if  dram_wrif (.clk(clk), .rst_n(rst_n));
-
-    // Descriptor table write port.
     logic              desc_we;
     logic [7:0]        desc_wr_addr;
     csd_descriptor_t   desc_wr_data;
-
-    // Output URAM write port (TB acts as the dense_out_collector).
     logic                       out_wr_en;
     logic [URAM_AW-1:0]         out_wr_addr;
     logic [URAM_DATA_W-1:0]     out_wr_data;
-
-    // -------------------------------------------------------------------------
-    // DUT.
-    // -------------------------------------------------------------------------
     memory_manager #(
         .DESC_DEPTH(256)
     ) dut (
@@ -113,12 +47,6 @@ module tb_memory_manager;
         .desc_wr_addr (desc_wr_addr),
         .desc_wr_data (desc_wr_data)
     );
-
-    // -------------------------------------------------------------------------
-    // DRAM stub - same shape as tb_csd_engine: on every accepted request,
-    // stream req_len beats with payload {DRAM_PATTERN_HI, addr + 8*i}.
-    // No stalls; the memory subsystem is not being timed here, only verified.
-    // -------------------------------------------------------------------------
     typedef enum logic [1:0] {
         D_IDLE = 2'b00,
         D_REQ  = 2'b01,
@@ -196,12 +124,6 @@ module tb_memory_manager;
             endcase
         end
     end
-
-    // -------------------------------------------------------------------------
-    // DRAM write-side stub for OP_ST_OUT. Accepts requests with no stalls,
-    // captures every wd beat into a queue alongside the running address so
-    // the scoreboard can reconstruct (dram_addr, urram_addr) per beat.
-    // -------------------------------------------------------------------------
     typedef enum logic [1:0] {
         WR_IDLE = 2'b00,
         WR_DATA = 2'b01
@@ -219,8 +141,6 @@ module tb_memory_manager;
     } st_out_beat_t;
 
     st_out_beat_t st_out_beats [$];
-
-    // req_ready high in IDLE; wd_ready high in DATA.
     assign dram_wrif.req_ready = (wr_state_q == WR_IDLE);
     assign dram_wrif.wd_ready  = (wr_state_q == WR_DATA);
 
@@ -264,13 +184,6 @@ module tb_memory_manager;
             st_out_beats.push_back(b);
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Auto-ack for both pingpongs. The TB models the compute core: when the
-    // memory_manager asserts drain_req, we ack one cycle later for one cycle.
-    // This uses the "pulse when drain_req && !drain_ack" pattern so the ack
-    // auto-drops on the following cycle (fsm leaves SWAP_DRAIN).
-    // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             dense_pp.drain_ack  <= 1'b0;
@@ -280,12 +193,6 @@ module tb_memory_manager;
             sparse_pp.drain_ack <= sparse_pp.drain_req && !sparse_pp.drain_ack;
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Per-pool per-bank golden mirrors. Sniffed from the memory_manager
-    // internals; the dut exposes fill_is_sparse / fill_wr_* only via the
-    // pingpong wrappers, so we peek at dut.u_dense_pp and dut.u_sparse_pp.
-    // -------------------------------------------------------------------------
     logic [URAM_DATA_W-1:0] gold_d_a [URAM_DEP];
     logic [URAM_DATA_W-1:0] gold_d_b [URAM_DEP];
     logic                   gold_d_a_w [URAM_DEP];
@@ -295,10 +202,6 @@ module tb_memory_manager;
     logic [URAM_DATA_W-1:0] gold_s_b [URAM_DEP];
     logic                   gold_s_a_w [URAM_DEP];
     logic                   gold_s_b_w [URAM_DEP];
-
-    // Predictor handles: TB latches the descriptor driving each fill so that
-    // on every internal fill write we can compute the expected {addr, data}
-    // and compare against what the manager committed.
     csd_descriptor_t        running_desc;
     logic                   running_active;
     int unsigned            running_idx;
@@ -306,12 +209,6 @@ module tb_memory_manager;
     int unsigned checks    = 0;
     int unsigned errors    = 0;
     int unsigned tb_errors = 0;
-
-    // Snapshot the descriptor the cycle the manager captures it. The TB
-    // serializes ops (one issue at a time + wait for done), so a start pulse
-    // for OP_LD_* always corresponds to an M_IDLE capture in the dut. We read
-    // desc_lookup via hierarchy -- it is combinational from memif.tile_id,
-    // which is stable at this cycle by the mem_issue_if contract.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             running_desc   <= '0;
@@ -329,10 +226,6 @@ module tb_memory_manager;
             end
         end
     end
-
-    // Score every fill write produced by the dut. The dense and sparse pools
-    // each get one mirror update path; fill_is_sparse_o inside the dut already
-    // demuxed wr_en so we just watch each pool's fill_wr_en wire.
     task automatic score_fill(
         input logic is_sparse_pool,
         input bank_sel_e fill_side,
@@ -370,8 +263,6 @@ module tb_memory_manager;
                      $time, is_sparse_pool ? "sparse" : "dense",
                      running_idx, exp_data, wr_data);
         end
-
-        // Commit to the correct per-pool per-bank mirror.
         if (!is_sparse_pool) begin
             if (fill_side == BANK_A) begin
                 gold_d_a[wr_addr]   = wr_data;
@@ -407,12 +298,6 @@ module tb_memory_manager;
                        .wr_data(dut.csd_fill_wr_data));
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Core-side read path verification. On every pingpong_if.rd_valid we
-    // look up the mirror of whichever bank was the compute side 2 cycles ago
-    // (URAM read latency) and compare.
-    // -------------------------------------------------------------------------
     logic [URAM_AW-1:0] d_rd_addr_q1, d_rd_addr_q2;
     logic               d_rd_en_q1,   d_rd_en_q2;
     bank_sel_e          d_rd_side_q1, d_rd_side_q2;
@@ -445,15 +330,8 @@ module tb_memory_manager;
             s_rd_side_q2 <= s_rd_side_q1;
         end
     end
-
-    // Blocking writes to TB counters. All scoring in this TB is blocking to
-    // avoid NBA/blocking races between the fill-scorer, readback-scorer, KV
-    // scorer, and the done-pulse watchdog.
     always_ff @(posedge clk) begin
         if (rst_n && dense_pp.rd_valid) begin
-            // The WIDE dense word at wide addr A holds natives [4A .. 4A+3] in leaf
-            // order (csd_wide_fill / uram_bank). Rebuild the expected 288b word from
-            // the 4 native fill mirrors; score only when all 4 leaves were written.
             logic [DENSE_PP_URAM_W-1:0] d_exp;
             logic                       d_all_w;
             logic [URAM_AW-1:0]         d_nbase;
@@ -518,17 +396,8 @@ module tb_memory_manager;
             endcase
         end
     end
-
-    // -------------------------------------------------------------------------
-    // KV mirror + comparator. Writes update gold_kv, reads compare 1 cycle
-    // later (kv_access_if contract).
-    // -------------------------------------------------------------------------
     logic [KV_DATA_W-1:0] gold_kv [KV_DEPTH];
     logic                 gold_kv_w [KV_DEPTH];
-
-    // 2-stage shadow: the KV BRAM now returns data 2 cycles after rd_en (output
-    // latch + OREG), so the addr matching the current rd_valid is from 2 cycles
-    // ago. Mirrors the dense/sparse URAM 2-stage shadows above.
     logic [KV_ADDR_W-1:0] kv_rd_addr_q1, kv_rd_addr_q2;
     logic                 kv_rd_en_q1,   kv_rd_en_q2;
 
@@ -554,10 +423,6 @@ module tb_memory_manager;
             end
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Drivers.
-    // -------------------------------------------------------------------------
     task automatic drive_idle();
         memif.start     <= 1'b0;
         memif.busy      <= 1'b0;
@@ -605,10 +470,6 @@ module tb_memory_manager;
         d.n_beats    = n_beats;
         return d;
     endfunction
-
-    // Dispatcher-facing issue task. Holds busy high from start pulse through
-    // the cycle on which done was observed. This mirrors the contract in
-    // mem_issue_if.sv (a_start_requires_busy, a_done_requires_busy).
     task automatic issue_mem_op(input macro_opc_e opc,
                                  input logic [7:0] tile_id,
                                  input logic       is_sparse);
@@ -621,7 +482,6 @@ module tb_memory_manager;
         @(posedge clk);
         @(negedge clk);
         memif.start     = 1'b0;
-        // Wait for done. Keep busy asserted.
         while (memif.done !== 1'b1) @(posedge clk);
         @(negedge clk);
         memif.busy      = 1'b0;
@@ -648,8 +508,6 @@ module tb_memory_manager;
         @(negedge clk);
         kvif.rd_en   = 1'b0;
     endtask
-
-    // Pulse a single core read on the selected pool. 2-cycle latency.
     task automatic dense_read(input logic [URAM_AW-1:0] a);
         @(negedge clk);
         dense_pp.rd_en   = 1'b1;
@@ -673,20 +531,12 @@ module tb_memory_manager;
         d = {$urandom(), $urandom(), $urandom(), $urandom(), $urandom()};
         return d;
     endfunction
-
-    // -------------------------------------------------------------------------
-    // done watchdog: mem_issue_if done must be 1-cycle pulse only.
-    // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst_n && memif.done && $past(memif.done, 1)) begin
             tb_errors = tb_errors + 1;
             $display("[%0t] memif.done held high > 1 cycle", $time);
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Main test sequence.
-    // -------------------------------------------------------------------------
     initial begin : main
         for (int i = 0; i < URAM_DEP; i++) begin
             gold_d_a[i] = '0; gold_d_a_w[i] = 1'b0;
@@ -703,8 +553,6 @@ module tb_memory_manager;
         repeat (5) @(posedge clk);
         rst_n = 1'b1;
         repeat (2) @(posedge clk);
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 0: reset quiescent", $time);
         if (memif.done !== 1'b0) begin
             tb_errors++;
@@ -723,21 +571,13 @@ module tb_memory_manager;
             tb_errors++;
             $display("[%0t] STAGE 0 FAIL: kv.rd_valid=%0b", $time, kvif.rd_valid);
         end
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 1: dense OP_LD_W_URAM + OP_PINGPONG + readback", $time);
-        // Program desc_table[0] = dense, 8 beats, uram_base=0x020, dram_base=0x0000_1000.
         write_desc(8'h00, mk_desc(.is_sparse(1'b0),
                                    .uram_base(URAM_AW'(12'h020)),
                                    .dram_base(32'h0000_1000),
                                    .n_beats(16'd8)));
-        // Initial: dense compute=A, fill=B. Fill lands in BANK_B.
         issue_mem_op(OP_LD_W_URAM, 8'h00, 1'b0);
-        // Swap: compute becomes BANK_B, which now has the fresh data.
         issue_mem_op(OP_PINGPONG, 8'h00, 1'b0);
-        // Read back. 8 natives at base 0x020 are packed into 8/WIDE wide words
-        // starting at wide addr 0x020>>2; read those (the checker rebuilds each
-        // 288b word from its 4 native mirrors).
         for (int j = 0; j < 8 / int'(DENSE_PP_URAM_WIDE); j++) begin
             dense_read(URAM_AW'((12'h020 >> $clog2(DENSE_PP_URAM_WIDE)) + j));
         end
@@ -747,8 +587,6 @@ module tb_memory_manager;
             $display("[%0t] STAGE 1 FAIL: dense compute side=%s after swap, expected BANK_B",
                      $time, dut.dense_compute_side.name());
         end
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 2: sparse OP_LD_A_URAM + OP_PINGPONG + readback", $time);
         write_desc(8'h01, mk_desc(.is_sparse(1'b1),
                                    .uram_base(URAM_AW'(12'h040)),
@@ -765,24 +603,17 @@ module tb_memory_manager;
             $display("[%0t] STAGE 2 FAIL: sparse compute side=%s after swap, expected BANK_B",
                      $time, dut.sparse_compute_side.name());
         end
-        // Dense pool should NOT have been disturbed.
         if (dut.dense_compute_side !== BANK_B) begin
             tb_errors++;
             $display("[%0t] STAGE 2 FAIL: dense compute side disturbed (%s)",
                      $time, dut.dense_compute_side.name());
         end
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 3: OP_ST_OUT end-to-end drain", $time);
         begin : stage3
             localparam int unsigned ST_OUT_NBEATS = 32;
             localparam logic [URAM_AW-1:0]      ST_URAM_BASE = URAM_AW'(12'h0C0);
             localparam logic [DRAM_ADDR_W-1:0]  ST_DRAM_BASE = 32'hCAFE_0000;
             int unsigned wait_iters;
-
-            // Pre-load the output URAM with a deterministic pattern. We drive
-            // out_wr_* directly (the dense_out_collector occupies this port
-            // in the SoC top; here the TB is the producer).
             for (int i = 0; i < int'(ST_OUT_NBEATS); i++) begin
                 @(negedge clk);
                 out_wr_en   = 1'b1;
@@ -792,25 +623,14 @@ module tb_memory_manager;
                 @(posedge clk);
             end
             @(negedge clk); out_wr_en = 1'b0;
-            // URAM write commits on posedge; let one cycle of settle pass.
             repeat (2) @(posedge clk);
-
-            // Program desc_table[0xFF] with the drain descriptor.
             write_desc(8'hFF, mk_desc(.is_sparse(1'b0),
                                       .uram_base(ST_URAM_BASE),
                                       .dram_base(ST_DRAM_BASE),
                                       .n_beats(DRAM_LEN_W'(ST_OUT_NBEATS))));
-
-            // Snapshot the beat queue size before the drain.
             wait_iters = st_out_beats.size();
-
-            // Issue the drain.
             issue_mem_op(OP_ST_OUT, 8'hFF, 1'b0);
-
-            // Allow tail beats to flush in case wd_ready stalled at the end.
             repeat (16) @(posedge clk);
-
-            // Verify ST_OUT_NBEATS new beats landed.
             if (st_out_beats.size() - wait_iters !== int'(ST_OUT_NBEATS)) begin
                 tb_errors++;
                 $display("[%0t] STAGE 3 FAIL: drained %0d beats, expected %0d",
@@ -843,13 +663,10 @@ module tb_memory_manager;
                 end
             end
         end
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 4: KV directed write/read round-trip", $time);
         kv_write(14'h0010, {16'hFEED, 128'hAAAA_5555_AAAA_5555_AAAA_5555_AAAA_5555});
         kv_read(14'h0010);
         @(posedge clk); @(posedge clk);
-        // Back-to-back writes then reads.
         @(negedge clk);
         kvif.wr_en = 1'b1;
         for (int i = 0; i < 16; i++) begin
@@ -869,8 +686,6 @@ module tb_memory_manager;
         end
         kvif.rd_en = 1'b0;
         repeat (3) @(posedge clk);
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 5: random %0d descriptors + interleaved KV", $time, N_DESC_RANDOM);
         begin : stage5
             for (int d = 0; d < N_DESC_RANDOM; d++) begin
@@ -882,10 +697,6 @@ module tb_memory_manager;
                 is_sp = $urandom_range(0, 1);
                 nb    = $urandom_range(1, MAX_BEATS);
                 base  = URAM_AW'($urandom_range(0, URAM_DEP - MAX_BEATS - int'(DENSE_PP_URAM_WIDE)));
-                // The WIDE dense pp requires DENSE_PP_URAM_WIDE-aligned fills (the
-                // csd_wide_fill contract: base & length multiples of WIDE). The real
-                // weight/activation descriptors satisfy this; sparse stays narrow so
-                // its fills may be arbitrary.
                 if (!is_sp) begin
                     base = URAM_AW'(base & ~URAM_AW'(DENSE_PP_URAM_WIDE - 1));
                     nb   = ((nb + int'(DENSE_PP_URAM_WIDE) - 1) / int'(DENSE_PP_URAM_WIDE))
@@ -897,25 +708,17 @@ module tb_memory_manager;
                                  .n_beats(DRAM_LEN_W'(nb)));
                 write_desc(8'(d + 2), desc);
                 issue_mem_op(OP_LD_W_URAM, 8'(d + 2), is_sp);
-
-                // Occasionally interleave a KV write (orthogonal path).
                 if ((d % 3) == 0) begin
                     kv_write(KV_ADDR_W'($urandom_range(0, KV_DEPTH-1)), rand_kv_data());
                 end
-
-                // Occasionally pingpong. This will also change which bank we
-                // validate against on the next round.
                 if ((d % 4) == 3) begin
                     issue_mem_op(OP_PINGPONG, 8'h00, is_sp);
-                    // Read a couple of addresses we just filled.
                     for (int i = 0; i < 4; i++) begin
                         automatic logic [URAM_AW-1:0] ra;
                         if (is_sp) begin
                             ra = URAM_AW'(desc.uram_base + URAM_AW'(i % nb));
                             sparse_read(ra);
                         end else begin
-                            // WIDE: read the i-th wide word of this dense descriptor
-                            // (nb is WIDE-aligned, so nb/WIDE wide words are full).
                             ra = URAM_AW'((desc.uram_base >> $clog2(DENSE_PP_URAM_WIDE))
                                           + URAM_AW'(i % (nb / int'(DENSE_PP_URAM_WIDE))));
                             dense_read(ra);
@@ -926,15 +729,9 @@ module tb_memory_manager;
             end
             repeat (4) @(posedge clk);
         end
-
-        // ------------------------------------------------------------------
         $display("[%0t] STAGE 6: unsupported-opcode nop path", $time);
-        // OP_NOP is not in the supported set for mem_issue_if; the manager
-        // takes the default arm (warning + 1-cycle done).
         issue_mem_op(OP_NOP, 8'h00, 1'b0);
         repeat (4) @(posedge clk);
-
-        // ------------------------------------------------------------------
         $display("=========================================================");
         if (errors == 0 && tb_errors == 0) begin
             $display(" tb_memory_manager: PASS  (%0d checks, 0 errors)", checks);
@@ -945,10 +742,6 @@ module tb_memory_manager;
         $display("=========================================================");
         $finish;
     end
-
-    // -------------------------------------------------------------------------
-    // Watchdog.
-    // -------------------------------------------------------------------------
     initial begin : watchdog
         #(5_000_000);
         $fatal(1, "tb_memory_manager: watchdog expired");

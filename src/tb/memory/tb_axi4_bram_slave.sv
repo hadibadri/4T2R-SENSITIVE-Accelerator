@@ -1,19 +1,4 @@
-// -----------------------------------------------------------------------------
-// tb_axi4_bram_slave.sv  (C5 — synthesizable BRAM AXI slave unit test)
-//
-// Round-trips data through the C2 adapters into the SYNTHESIZABLE slave:
-//
-//   TB (csd_dram_wr_if.mgr) -> axi4_write_adapter -.
-//                                                   >-- axi4_if --> axi4_bram_slave
-//   TB (csd_dram_if.mgr)    <- axi4_read_adapter  -'
-//
-// Same burst-splitter stress set as tb_axi4_dram_adapter, but against the real
-// BRAM-backed slave used for C5 closure. The slave aliases distinct DRAM regions
-// into the low DEPTH index bits; this test is SEQUENTIAL write-then-read per
-// region (each region fully verified before the next), and every region's beat
-// count stays < DEPTH, so aliasing never corrupts a live window. Proving the
-// slave is a correct AXI endpoint here de-risks the long non-OOC synth run.
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 

@@ -1,38 +1,4 @@
-// -----------------------------------------------------------------------------
-// noc_router.sv
-//
-// Single-source circuit-switched multicast router for the ArchBetter NoC.
-//
-// Life cycle:
-//   1. CONFIGURE phase  : the dispatcher writes the path table through the
-//                         noc_cfg_if handshake (one entry per NOC_PATH_ID_W
-//                         handle). cfg_ready is high while we are still in
-//                         this phase.
-//   2. path_commit pulse: a single-cycle pulse on cfg.path_commit freezes the
-//                         table. The router enters STREAMING mode and refuses
-//                         further cfg writes (cfg_ready goes low).
-//   3. STREAMING phase  : pure combinational mux. For every beat on the ingress
-//                         (rt.in_valid), the router looks up the current
-//                         path_id's dst_mask and forwards the beat to every
-//                         egress whose bit is set in the mask. Ingress fires
-//                         only when all selected egresses are ready
-//                         (hold-on-backpressure).
-//
-// Mapping convention:
-//   FANOUT == NOC_NODES. Egress port index d corresponds 1:1 to global NoC node
-//   d. dst_mask[d] == 1 means "forward this beat to egress d". Any fabric that
-//   wants a non-trivial source->destination map uses a reduced FANOUT (<64)
-//   and translates via noc_fabric; this router stays dumb and topology-free.
-//
-// Latency contract:
-//   Ingress-to-egress : 0 cycles (combinational mux).
-//   Commit-to-stream  : 1 cycle (the cycle after path_commit, rt.in_ready can
-//                       rise when egresses are ready).
-//
-// Resource class:
-//   Path table is a small register file (NOC_PATH_HANDLES entries of
-//   noc_path_cfg_t). No DSP. No BRAM. No URAM.
-// -----------------------------------------------------------------------------
+
 `ifndef ARCHBETTER_NOC_ROUTER_SV
 `define ARCHBETTER_NOC_ROUTER_SV
 `default_nettype none
@@ -51,38 +17,15 @@ module noc_router
     noc_cfg_if.slave      cfg,
     noc_router_if.router  rt
 );
-
-    // -------------------------------------------------------------------------
-    // Elaboration-time checks. FANOUT must not exceed the global node count,
-    // or the dst_mask high bits would silently be lost.
-    // -------------------------------------------------------------------------
     initial begin : elab_checks
         if (FANOUT > NOC_NODES) begin
             $fatal(1, "noc_router: FANOUT=%0d exceeds NOC_NODES=%0d",
                    FANOUT, NOC_NODES);
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Path table. NOC_PATH_HANDLES small entries; inference target is LUTRAM
-    // (distributed). A synchronous reset on the storage would force FF
-    // inference (~2.3k FFs per router at NOC_PATH_HANDLES=32, ~73b entries)
-    // because LUTRAM has no reset port. We rely on the `committed=0` gate
-    // to block any downstream effect of the table before entries are
-    // written; under that gate, uninitialized contents are functionally
-    // inert. Xilinx LUTRAM defaults to 0 in the bitstream.
-    // -------------------------------------------------------------------------
-    // Phase-7d: ram_style="distributed" was being ignored (Synth 8-7186) because
-    // the packed-struct access pattern with per-field cfg_valid writes does not
-    // fit LUTRAM inference. Synthesizes as a register file, which is the right
-    // primitive class for NOC_PATH_HANDLES = 32 entries of small control state.
     noc_path_cfg_t path_tab [NOC_PATH_HANDLES];
 
     logic committed;
-
-    // -------------------------------------------------------------------------
-    // CONFIG phase: accept cfg writes until path_commit fires.
-    // -------------------------------------------------------------------------
     assign cfg.cfg_ready = !committed;
 
     always_ff @(posedge clk) begin
@@ -97,10 +40,6 @@ module noc_router
             end
         end
     end
-
-    // -------------------------------------------------------------------------
-    // STREAMING phase: pure combinational mux.
-    // -------------------------------------------------------------------------
     noc_mask_t         cur_mask_full;
     logic [FANOUT-1:0] cur_mask;
     logic [FANOUT-1:0] egress_active;
@@ -111,7 +50,6 @@ module noc_router
         cur_mask      = cur_mask_full[FANOUT-1:0];
         for (int d = 0; d < FANOUT; d++) begin
             egress_active[d] = committed && rt.in_valid && cur_mask[d];
-            // Egress d is "ok" if it is not selected OR it is ready.
             egress_ok[d]     = !cur_mask[d] || rt.out_ready[d];
         end
     end
@@ -120,15 +58,7 @@ module noc_router
     logic any_dst;
     assign all_egress_ok = &egress_ok;
     assign any_dst       = |cur_mask;
-
-    // Ingress-ready does NOT depend on in_valid; it says "I can accept a beat
-    // this cycle if you raise valid". This keeps handshake composable.
-    // An empty mask (no destinations) is treated as a programming error: we
-    // refuse the beat so the source stalls and the bug is visible rather than
-    // silently dropping traffic.
     assign rt.in_ready = committed && any_dst && all_egress_ok;
-
-    // Per-egress drive.
     always_comb begin
         for (int d = 0; d < FANOUT; d++) begin
             rt.out_data[d]  = rt.in_data;
@@ -139,8 +69,6 @@ module noc_router
     end
 
 `ifndef SYNTHESIS
-    // Pre-commit, the router must NEVER drive an out_valid. (config-before-
-    // streaming invariant.)
     property p_no_stream_before_commit;
         @(posedge clk) disable iff (!rst_n)
         !committed |-> (rt.out_valid == '0) && (rt.in_ready == 1'b0);
@@ -148,9 +76,6 @@ module noc_router
     a_no_stream_before_commit: assert property (p_no_stream_before_commit)
         else $error("noc_router[%0d]: streamed or asserted in_ready before commit",
                     ROUTER_ID);
-
-    // Once committed, we never re-open the table. (If a re-open is ever wanted
-    // later, it must come through a new macro-op, not silently.)
     property p_commit_is_sticky;
         @(posedge clk) disable iff (!rst_n)
         committed |=> committed;
@@ -158,11 +83,6 @@ module noc_router
     a_commit_is_sticky: assert property (p_commit_is_sticky)
         else $error("noc_router[%0d]: committed dropped after it was set",
                     ROUTER_ID);
-
-    // path_id must stay stable while a beat is stalled. If it changed
-    // mid-stall, cur_mask would flip and out_valid on some egress could
-    // drop without that egress acknowledging - violating the per-egress
-    // strm_if hold-on-backpressure contract.
     property p_path_id_stable_during_stall;
         @(posedge clk) disable iff (!rst_n)
         (rt.in_valid && !rt.in_ready) |=> $stable(rt.path_id);
@@ -175,4 +95,4 @@ module noc_router
 endmodule : noc_router
 
 `default_nettype wire
-`endif // ARCHBETTER_NOC_ROUTER_SV
+`endif

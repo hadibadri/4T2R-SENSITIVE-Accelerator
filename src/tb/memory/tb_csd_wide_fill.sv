@@ -1,30 +1,14 @@
-// -----------------------------------------------------------------------------
-// tb_csd_wide_fill.sv  (R6.8b.2)
-//
-// Unit test for csd_wide_fill: the narrow-72b -> wide-288b fill assembler for
-// the WIDE dense ping-pong. Drives a contiguous native fill stream and checks
-// that every WIDE-th beat emits one wide write whose leaves carry the WIDE
-// preceding natives in order, at wide_addr = native_addr / WIDE.
-//
-// Coverage:
-//   CASE 1: contiguous stream, no gaps (8 wide words from base 0).
-//   CASE 2: stream with idle gaps between beats (models background fill pacing);
-//           grouping must be unaffected (adapter acts only on in_wr_en).
-//   CASE 3: a second WIDE-aligned descriptor at a different base (restart leaf 0).
-//   Negative coverage of the mid-group-jump assertion is left to inspection (the
-//   workload is aligned by construction); driving a deliberate gap would trip the
-//   a_no_midgroup_jump $error, which is the intended fail-loud behaviour.
-// -----------------------------------------------------------------------------
+
 `timescale 1ns/1ps
 `default_nettype none
 
 module tb_csd_wide_fill;
     import types_pkg::*;
 
-    localparam int unsigned WIDE   = DENSE_PP_URAM_WIDE;   // 4
-    localparam int unsigned LEAF_W = URAM_WIDTH_BITS;      // 72
-    localparam int unsigned ADDR_W = URAM_ADDR_W;          // 12
-    localparam int unsigned WIDE_W = WIDE * LEAF_W;        // 288
+    localparam int unsigned WIDE   = DENSE_PP_URAM_WIDE;
+    localparam int unsigned LEAF_W = URAM_WIDTH_BITS;
+    localparam int unsigned ADDR_W = URAM_ADDR_W;
+    localparam int unsigned WIDE_W = WIDE * LEAF_W;
 
     logic clk;
     logic rst_n;
@@ -53,15 +37,11 @@ module tb_csd_wide_fill;
         .out_wr_addr(out_wr_addr),
         .out_wr_data(out_wr_data)
     );
-
-    // Scoreboard: native address -> driven data.
     logic [LEAF_W-1:0] nat [int];
 
     int unsigned checks = 0;
     int unsigned errors = 0;
     int unsigned wide_writes = 0;
-
-    // Build a distinct 72b word per (addr) so a swapped/dropped leaf mismatches.
     function automatic logic [LEAF_W-1:0] mk(input int unsigned a);
         logic [LEAF_W-1:0] v;
         v = '0;
@@ -70,8 +50,6 @@ module tb_csd_wide_fill;
         end
         return v;
     endfunction
-
-    // Compare a fired wide write against the scoreboard.
     task automatic check_wide();
         logic [WIDE_W-1:0] exp;
         int unsigned w;
@@ -88,16 +66,13 @@ module tb_csd_wide_fill;
                      $time, w, exp, out_wr_data);
         end
     endtask
-
-    // Drive one native beat (in_wr_en stays high across consecutive beat() calls).
     task automatic beat(input logic [ADDR_W-1:0] a, input logic [LEAF_W-1:0] d);
         @(negedge clk);
         in_wr_en   = 1'b1;
         in_wr_addr = a;
         in_wr_data = d;
         nat[a]     = d;
-        #1;  // let combinational outputs settle
-        // out_wr_en must fire exactly on the last leaf of a group.
+        #1;
         checks++;
         if (out_wr_en !== ((a[$clog2(WIDE)-1:0]) == ($clog2(WIDE))'(WIDE-1))) begin
             errors++;
@@ -129,32 +104,22 @@ module tb_csd_wide_fill;
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
         @(posedge clk);
-
-        // ------------------------------------------------------------------
         $display("[%0t] CASE 1: contiguous stream, 8 wide words from base 0", $time);
         for (int unsigned a = 0; a < 8*WIDE; a++) begin
             beat(ADDR_W'(a), mk(a));
         end
         idle(2);
-
-        // ------------------------------------------------------------------
         $display("[%0t] CASE 2: gapped stream (idle between every beat)", $time);
-        // Base 64 (WIDE-aligned). One idle cycle between each native beat.
         for (int unsigned a = 64; a < 64 + 6*WIDE; a++) begin
             beat(ADDR_W'(a), mk(a));
             idle(1);
         end
         idle(2);
-
-        // ------------------------------------------------------------------
         $display("[%0t] CASE 3: second aligned descriptor at base 512", $time);
         for (int unsigned a = 512; a < 512 + 4*WIDE; a++) begin
             beat(ADDR_W'(a), mk(a));
         end
         idle(2);
-
-        // ------------------------------------------------------------------
-        // Expected wide writes: 8 (case1) + 6 (case2) + 4 (case3) = 18.
         if (wide_writes != 18) begin
             errors++;
             $display("[%0t] wide_writes=%0d, expected 18", $time, wide_writes);
