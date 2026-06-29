@@ -78,7 +78,7 @@ The project targets the edge-LLM frontier with a focus on throughput, latency, e
 
 The timing story is captured in the figure below. It highlights the critical-path structure, the clocking strategy, and the latency budget for the dense and sparse pipelines. The design intentionally keeps the compute clock and memory clock separate and routes all crossings through explicit CDC-safe interfaces rather than ad-hoc synchronizers. The implementation closes at 225 MHz with a positive WNS of +0.152 ns.
 
-![Timing view](timing.png)
+![Timing view](Timing.png)
 
 ## Visual overview
 
@@ -92,11 +92,11 @@ The timing story is captured in the figure below. It highlights the critical-pat
 
 ### Utilization view
 
-![Utilization view](UTilization.png)
+![Utilization view](Utilization.png)
 
 ### Power view
 
-![Power metrics](powerMetrics.png)
+![Power metrics](Power.png)
 
 ### Speed and throughput view
 
