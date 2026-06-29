@@ -4,24 +4,63 @@ A research-oriented accelerator for edge LLM inference built around a digital tw
 
 ## Why this project exists
 
-ArchBetter is a hardware-software research prototype aimed at pushing edge LLM serving forward by combining:
+Edge LLM serving is constrained by memory bandwidth, on-chip storage, and the cost of moving weights and activations. The architecture in this repository addresses that problem with a hybrid accelerator that mixes dense compute, sparse execution, memory staging, and a deterministic control plane. The design is meant to be read as a full SoC-level architecture story, not as a loose collection of RTL files.
 
-- a dense compute core for BFP12-style matrix work,
-- a sparse/ternary execution path for efficiency-minded FFN traffic,
-- a staged memory hierarchy with URAM ping-pong support and KV-cache handling,
-- and a dispatcher-driven control plane for coordinated execution.
+## The architecture in depth
 
-The goal is not just to build hardware, but to build a credible research artifact that can be explained, compared, and defended.
+### 1. Dense core
 
-## What the project shows
+The dense core is the main GEMM engine for the workload. It is implemented as a logically large $128 \times 128$ matrix-vector fabric, but it is mapped onto a smaller physical kernel through time-multiplexing rather than by instantiating a literal 16,384-PE spatial array on the FPGA. In this design, the logical array is partitioned into tiles, and the physical kernel reuses those tile resources over time.
 
-This work is organized around three main ideas:
+Each processing element is a digital twin of a 4T2R ReRAM CIM cell. Instead of modeling a literal analog cell as a floating physical device, the RTL models the same mathematical behavior: a conductance-inspired multiply-and-accumulate primitive that can be calibrated and extended with noise hooks for future reliability studies. The arithmetic path uses BFP12-style values, with a shared exponent per block and a mantissa multiply-accumulate path that is fused into the PE pipeline.
 
-1. Dense compute with a 4T2R-inspired digital twin
-2. Sparse acceleration for ternary-weight workloads
-3. A full-stack memory and control strategy that makes the system practical
+The dense execution flow is weight-streaming and output-stationary:
 
-The design is meant to be read as a full architecture story, not just a collection of RTL files.
+1. A tile of weights is loaded into the physical PE fabric.
+2. Activations are broadcast across the tile and consumed in lockstep.
+3. Each group produces a partial result for a slice of the output columns.
+4. Those partials flow into an array-level accumulator bank that holds the running sum for each output column until the full tile traversal completes.
+
+This organization keeps the most expensive arithmetic localized inside the physical group while avoiding a costly global reduction tree. The result is a dense core that preserves the logical throughput of a larger systolic fabric while remaining practical on the target device.
+
+### 2. Sparse core
+
+The sparse core targets the parts of the workload that are naturally ternary or near-sparse. Its purpose is not to replace the dense core, but to provide an efficient path for sparse or low-precision operations that would otherwise waste dense datapath bandwidth. The sparse path uses a table-lookup matrix multiplication style mechanism with ternary weights.
+
+Instead of using DSP-heavy multiply logic, the sparse core stores precomputed signed sum tables in LUTRAM or SRL-based structures. The weight pattern becomes the address, and the table emits the sum that would normally be produced by a sparse multiply. This makes the sparse core extremely lightweight and keeps its resource profile aligned with the project’s efficiency goals.
+
+The sparse core is especially useful for FFN-style patterns and for tiles that are mostly zero or have very small dynamic range. The dense and sparse paths communicate through a dedicated streaming interface so the control plane can route work to the correct execution engine without forcing the dense core to absorb sparse-only traffic.
+
+### 3. Memory system and staging
+
+The memory subsystem is designed around URAM ping-pong staging and burst-friendly fill logic. Four URAM banks are used as a compute/fill pair for the dense path and another compute/fill pair for the sparse path, with an additional output staging structure to capture dense results before they are drained out to the system.
+
+The memory manager performs three linked functions:
+
+- It stages weights and activations into the correct ping-pong bank.
+- It feeds the CSD engine so compressed data from DRAM is unpacked and converted on the way into URAM.
+- It coordinates the dequantization boundary so quantized values can be converted into the BFP12 format needed by the dense core before compute begins.
+
+The design also includes a BRAM-based KV cache and a shred controller that tracks tile usage and can demote or promote precision classes based on usage and error feedback. That allows the system to trade off storage pressure and compute fidelity without changing the outer execution contract.
+
+### 4. Network routers and interconnect
+
+The interconnect is a circuit-switched NoC rather than an AXI-style fabric. The routers are configured ahead of execution and then behave as deterministic mux-based paths for the duration of the transfer. This is a deliberate design choice: the dispatcher commits routes before data moves, so the network does not need to make dynamic arbitration decisions on a per-beat basis.
+
+The NoC carries multicast traffic through destination masks. A multicast beat is accepted only when all selected destinations are ready, which preserves the hold-on-backpressure behavior expected by the streaming datapath. The routers are therefore simple, predictable, and aligned with the timing and area goals of the system. They are used to broadcast activations, fan out weight streams, and move partial outputs between the compute cores and the collectors.
+
+### 5. Controllers and control plane
+
+The system is governed by a macro-instruction dispatcher rather than by a generic host-driven state machine. The dispatcher decodes compact instructions, configures the relevant subsystems, and then issues the execution schedule. Before compute begins, it programs the NoC paths, selects the active ping-pong banks, and locks in tile traversal decisions so the datapath can run without per-beat control overhead.
+
+The control plane is split into several cooperating blocks:
+
+- The dispatcher issues macro-ops and maintains the execution schedule.
+- The memory manager handles staging, fill, spill, and cache behavior.
+- The shred controller tracks tile usage and drives precision policy.
+- The drift-refresh controller schedules refresh activity and injects the AC stimulus into the digital-twin noise hooks.
+
+This separation makes the architecture easier to verify and easier to reason about, because each subsystem has a clear contract and a narrow set of responsibilities.
 
 ## Key results
 
@@ -31,16 +70,13 @@ The project targets the edge-LLM frontier with a focus on throughput, latency, e
 - Measured reload-bound corner: roughly 8.69 GOPS at the small-K reference point
 - Power model: about 1.5 W for the accelerator core at the reported operating point
 - Decode-oriented operating band: competitive token throughput with the shred-based compression strategy
-- Research framing: the design is positioned as a full SoC-level contribution, not a raw analog macro comparison
+- Research framing: the design is positioned as a full SoC-level contribution rather than as a raw analog macro comparison
 
-## Architecture at a glance
+## Timing and implementation view
 
-The project is organized around a hybrid pipeline:
+The timing story is captured in the figure below. It highlights the critical-path structure, the clocking strategy, and the latency budget for the dense and sparse pipelines. The design intentionally keeps the compute clock and memory clock separate and routes all crossings through explicit CDC-safe interfaces rather than ad-hoc synchronizers.
 
-- Dense core for the main GEMM-style compute path
-- Sparse core for ternary-friendly operations
-- Memory manager for URAM staging, CSD fill logic, and KV-cache flow
-- NoC and dispatcher to route data and schedule execution
+![Timing view](timing.png)
 
 ## Visual overview
 
@@ -55,10 +91,6 @@ The project is organized around a hybrid pipeline:
 ### Utilization view
 
 ![Utilization view](UTilization.png)
-
-### Timing view
-
-![Timing view](timing.png)
 
 ### Power view
 
@@ -80,17 +112,6 @@ src/          # RTL, testbenches, constraints, scripts
  tools/       # analytics and modeling utilities
 ```
 
-## Research documents
-
-The repository includes the following supporting documents:
-
-- [docs/ARCHBETTER_MASTERCLASS.md](docs/ARCHBETTER_MASTERCLASS.md)
-- [docs/ANALYTICS_MODEL.md](docs/ANALYTICS_MODEL.md)
-- [docs/LITERATURE_SURVEY_2026.md](docs/LITERATURE_SURVEY_2026.md)
-- [docs/WEIGHT_RESIDENCY_DESIGN.md](docs/WEIGHT_RESIDENCY_DESIGN.md)
-
-These documents explain the architectural reasoning, the analytical model, and the research positioning.
-
 ## Getting started
 
 ### Prerequisites
@@ -108,15 +129,6 @@ vivado project_1.xpr
 ### Explore the design
 
 The RTL and verification flow live under the src tree. The supporting research and modeling material lives under docs and tools.
-
-## Note on source visibility
-
-Because this project is intended for research publication, the source tree can be kept private or moved to a restricted-access repository if you want a stricter boundary between public-facing material and the full implementation. GitHub does not support making only one subfolder private inside a public repository, so the closest options are either:
-
-- keep the repository private and publish a public landing page separately, or
-- keep the public-facing material here and host the complete RTL in a private repository
-
-If you want, I can help set up that private/public split next.
 
 ## License
 
