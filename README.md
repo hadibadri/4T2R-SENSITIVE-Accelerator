@@ -66,15 +66,17 @@ This separation makes the architecture easier to verify and easier to reason abo
 
 The project targets the edge-LLM frontier with a focus on throughput, latency, energy, and the ability to serve real model workloads.
 
-- Peak dense-core throughput model: about 230 GOPS at the stated operating point
-- Measured reload-bound corner: roughly 8.69 GOPS at the small-K reference point
-- Power model: about 1.5 W for the accelerator core at the reported operating point
+- Peak dense-core throughput model: about 230.4 GOPS at the stated operating point
+- Measured reload-bound corner: about 8.69 GOPS at the small-K reference point
+- Timing: 225 MHz compute clock with a reported WNS of +0.152 ns
+- Utilization: 512 DSP48E2 (28.1%), 31,659 LUTs (14.6%), 63,357 FFs (14.6%), 91.5 BRAM36-equivalent (19.1%), and 11 URAM288 (17.2%)
+- Power: about 1.5 W for the accelerator core at the reported operating point
 - Decode-oriented operating band: competitive token throughput with the shred-based compression strategy
 - Research framing: the design is positioned as a full SoC-level contribution rather than as a raw analog macro comparison
 
 ## Timing and implementation view
 
-The timing story is captured in the figure below. It highlights the critical-path structure, the clocking strategy, and the latency budget for the dense and sparse pipelines. The design intentionally keeps the compute clock and memory clock separate and routes all crossings through explicit CDC-safe interfaces rather than ad-hoc synchronizers.
+The timing story is captured in the figure below. It highlights the critical-path structure, the clocking strategy, and the latency budget for the dense and sparse pipelines. The design intentionally keeps the compute clock and memory clock separate and routes all crossings through explicit CDC-safe interfaces rather than ad-hoc synchronizers. The implementation closes at 225 MHz with a positive WNS of +0.152 ns.
 
 ![Timing view](timing.png)
 
