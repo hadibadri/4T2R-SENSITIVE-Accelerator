@@ -1,0 +1,25 @@
+# Vivado / simulation artifacts
+project_1.cache/
+project_1.hw/
+project_1.ip_user_files/
+project_1.runs/
+project_1.sim/
+project_1.srcs/
+project_1.xpr.backup*
+reports/
+sim_netlist/
+*.jou
+*.log
+*.pb
+*.rpt
+*.dcp
+*.bit
+*.vdi
+*.wdb
+*.str
+*.xml
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
