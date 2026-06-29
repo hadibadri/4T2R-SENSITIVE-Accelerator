@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(vivado -mode batch -nojournal -nolog -source src/scripts/run_tb_dense_array.tcl project_1.xpr)",
+      "Bash(vivado -version)",
+      "Read(//c/Xilinx/**)",
+      "Read(//c/Program Files/Xilinx/**)",
+      "Read(//c/tools/Xilinx/**)",
+      "Bash(where vivado *)",
+      "Bash(which vivado *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Write-Host \"step1\"; $r = Get-ChildItem -Path \"C:\\\\\" -Filter \"vivado.bat\" -Recurse -ErrorAction SilentlyContinue -Depth 4 2>$null; Write-Host \\(\"count=\" + $r.Count\\); $r | Select-Object -First 5 -ExpandProperty FullName | Write-Host; Write-Host \"step2\"; $r2 = Get-ChildItem -Path \"C:\\\\\" -Filter \"Xilinx\" -Directory -ErrorAction SilentlyContinue -Depth 3 2>$null; $r2 | Select-Object -ExpandProperty FullName | Write-Host)",
+      "PowerShell(vivado *)",
+      "Bash(/c/AMDDesignTools/2025.2/Vivado/bin/vivado -mode batch -nojournal -nolog -source src/scripts/run_tb_dense_out_collector.tcl project_1.xpr)",
+      "Bash(vivado -mode batch -nojournal -nolog -source src/scripts/run_tb_archbetter_top.tcl project_1.xpr)",
+      "Bash(claude update *)",
+      "PowerShell(npm update *)",
+      "Bash(grep -nE \"^module|input |output |what|drain|DRAM|URAM|//\" src/rtl/memory/csd_drain/csd_drain_engine.sv)",
+      "Bash(command -v vivado xvlog xsim)",
+      "PowerShell(Select-String *)",
+      "Bash(rm -f sim_collector.log)",
+      "Bash(rm -rf .xsim_collector)",
+      "Bash(ls -d .xsim_collector)",
+      "Bash(awk -F: '$1>740 && $1<790')",
+      "Bash(awk -F: '$1>685 && $1<700')",
+      "Bash(grep -vE \"^\\\\s*//\")",
+      "Bash(grep -ivE \"//|build_|fill_\")",
+      "Bash(xargs ls -lt)",
+      "Bash(grep -v \"module sparse_tile\\\\|sparse_tile.sv\\\\|//\")",
+      "PowerShell(Get-Process *)",
+      "Bash(grep -nA14 \"typedef struct.*csd_descriptor\\\\|csd_descriptor_t;\" src/rtl/common/types_pkg.sv)",
+      "Bash(xargs wc -l)",
+      "Bash(python -c ' *)",
+      "WebSearch",
+      "Bash(grep -nE '^#{1,3} ' docs/WEIGHT_RESIDENCY_DESIGN.md)",
+      "Bash(python bitexact.py)",
+      "Bash(python -c \"import competitors as c; print\\('cohort entries:', len\\(c.COHORT\\), '| arch ok:', 'tok_s_decode_bfp12_shred' in c.ARCHBETTER\\)\")",
+      "Bash(python twin_runner.py)",
+      "Bash(python *)"
+    ]
+  }
+}
